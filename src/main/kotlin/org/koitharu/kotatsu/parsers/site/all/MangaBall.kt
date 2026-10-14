@@ -33,6 +33,7 @@ import org.koitharu.kotatsu.parsers.util.nullIfEmpty
 import org.koitharu.kotatsu.parsers.util.oneOrThrowIfMany
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseSafe
+import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
@@ -164,13 +165,23 @@ internal abstract class MangaBallParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		// The chapter listing only accepts the ObjectId. Manga saved by the legacy parser (or shared
-		// links) are addressed by slug, which the detail endpoint tolerates but the chapter listing
-		// silently returns `data = null` for — so resolve the slug first or no chapters are shown.
-		val id = resolveTitleId(manga.url) ?: manga.url
-		val json = client.httpGet("$API_URL/title/detail/$id", getApiHeaders()).parseJson()
-		val data = json.optJSONObject("data") ?: return manga
-		val detailed = data.toManga(id)
+		// The detail endpoint accepts both the ObjectId and the canonical slug, and its response always
+		// carries the ObjectId. The chapter listing below, however, silently returns `data = null` for a
+		// slug, so every request is addressed by the id resolved from the detail response.
+		val requested = manga.url
+		val data = runCatchingCancellable {
+			client.httpGet("$API_URL/title/detail/$requested", getApiHeaders())
+				.parseJson()
+				.optJSONObject("data")
+		}.getOrNull()
+		val id = data?.let { it.optNullableString("id") ?: it.optNullableString("_id") } ?: requested
+		val chapters = runCatchingCancellable { getChapterList(id) }.getOrDefault(emptyList())
+		val detailed = data?.toManga(id)
+		if (detailed == null) {
+			// Removed title, unknown id or a transient server error: never let the details screen fail
+			// with a generic error — return the input with a non-null chapter list instead.
+			return manga.copy(chapters = manga.chapters ?: chapters)
+		}
 		return detailed.copy(
 			title = detailed.title.nullIfEmpty() ?: manga.title,
 			altTitles = detailed.altTitles.ifEmpty { manga.altTitles },
@@ -178,7 +189,7 @@ internal abstract class MangaBallParser(
 			largeCoverUrl = detailed.largeCoverUrl ?: detailed.coverUrl ?: manga.largeCoverUrl,
 			description = data.optJSONArray("description").toStringSet().joinToString("\n").nullIfEmpty()
 				?: manga.description,
-			chapters = getChapterList(id),
+			chapters = chapters,
 		)
 	}
 
@@ -248,43 +259,15 @@ internal abstract class MangaBallParser(
 		if (host != domain && host != "www.$domain") {
 			return null
 		}
-		val id = when (link.pathSegments.firstOrNull()) {
-			"title-detail" -> resolveTitleId(link.pathSegments.getOrNull(1))
+		val slugOrId = when (link.pathSegments.firstOrNull()) {
+			"title-detail" -> link.pathSegments.getOrNull(1)
 			"chapter-detail" -> resolveTitleIdFromChapter(
 				"$BASE_URL/chapter-detail/${link.pathSegments.getOrNull(1)}",
 			)
 			else -> null
-		} ?: return null
-		return getDetails(seedManga(id))
-	}
-
-	private suspend fun resolveTitleId(value: String?): String? {
-		if (value.isNullOrEmpty()) {
-			return null
-		}
-		if (TITLE_ID_REGEX.matches(value)) {
-			return value
-		}
-		// The API addresses titles by objectId, but shared/canonical links may use a slug.
-		val url = "$API_URL/title/search-advanced".toHttpUrl().newBuilder()
-			.addQueryParameter("keyword", value)
-			.addQueryParameter("page", "1")
-			.addQueryParameter("limit", "10")
-			.addQueryParameter("adult_mode", "all")
-			.build()
-		val data = client.httpGet(url, getApiHeaders()).parseJson().optJSONArray("data") ?: return null
-		var fallback: String? = null
-		for (i in 0 until data.length()) {
-			val item = data.optJSONObject(i) ?: continue
-			val itemId = item.optString("id").nullIfEmpty() ?: continue
-			if (item.optString("slug") == value) {
-				return itemId
-			}
-			if (fallback == null) {
-				fallback = itemId
-			}
-		}
-		return fallback
+		}?.takeIf { it.isNotEmpty() } ?: return null
+		// getDetails accepts a slug as well and resolves the ObjectId from the response.
+		return getDetails(seedManga(slugOrId))
 	}
 
 	private suspend fun resolveSearchUrl(url: String): List<Manga> {
@@ -373,19 +356,23 @@ internal abstract class MangaBallParser(
 	private fun JSONObject.extractCover(): String? {
 		val image = optJSONObject("image")
 		if (image != null) {
-			// The site's own cover lives on the image CDN and is the only field that is present for
-			// almost every title. `image.file` is often a tiny Google thumbnail and `cdn_mangadex` is
-			// missing for a good share of titles, so prefer the local cover.
+			// Prefer hosts that serve covers to any client. The site's own CDN (`cover.path`) is the
+			// canonical cover but requires a `Referer` and throttles bursts of requests, while
+			// `cdn.mangaupdates.com` (`image.file` for part of the catalogue) no longer resolves —
+			// so both are used only as a fallback.
+			image.optNullableString("cdn_mangadex")?.let { return it }
+			val mirror = image.optNullableString("file")
+				?: image.optNullableString("cdn_mangaupdate")
+				?: image.optNullableString("cdn_mangaupdates")
+			if (mirror != null && !mirror.contains("mangaupdates.com")) {
+				return mirror
+			}
 			val path = image.optJSONObject("cover")?.optNullableString("path")
 			if (path != null) {
 				return if (path.startsWith("http")) path else "$COVER_BASE_URL/$path"
 			}
-			val fromImage = image.optNullableString("cdn_mangadex")
-				?: image.optNullableString("cdn_mangaupdate")
-				?: image.optNullableString("cdn_mangaupdates")
-				?: image.optNullableString("file")
-			if (fromImage != null) {
-				return fromImage
+			if (mirror != null) {
+				return mirror
 			}
 		}
 		return optNullableString("cover")
@@ -501,7 +488,6 @@ internal abstract class MangaBallParser(
 		private val CHAPTER_PAGES_REGEX = Regex("""\\"pages\\":\[(.*?)\]""")
 		private val IMAGE_URL_REGEX = Regex("""https?://[^"\\\s]+""")
 		private val CHAPTER_TITLE_ID_REGEX = Regex("""\\"title\\":\{\\"id\\":\\"([a-fA-F0-9]{24})""")
-		private val TITLE_ID_REGEX = Regex("[a-fA-F0-9]{24}")
 		private val ADULT_TAG_TITLES = setOf(
 			"Adult",
 			"Ecchi",
