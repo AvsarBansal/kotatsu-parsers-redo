@@ -164,14 +164,18 @@ internal abstract class MangaBallParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val id = manga.url
+		// The chapter listing only accepts the ObjectId. Manga saved by the legacy parser (or shared
+		// links) are addressed by slug, which the detail endpoint tolerates but the chapter listing
+		// silently returns `data = null` for — so resolve the slug first or no chapters are shown.
+		val id = resolveTitleId(manga.url) ?: manga.url
 		val json = client.httpGet("$API_URL/title/detail/$id", getApiHeaders()).parseJson()
 		val data = json.optJSONObject("data") ?: return manga
 		val detailed = data.toManga(id)
 		return detailed.copy(
 			title = detailed.title.nullIfEmpty() ?: manga.title,
 			altTitles = detailed.altTitles.ifEmpty { manga.altTitles },
-			largeCoverUrl = detailed.coverUrl ?: manga.largeCoverUrl,
+			coverUrl = detailed.coverUrl ?: manga.coverUrl,
+			largeCoverUrl = detailed.largeCoverUrl ?: detailed.coverUrl ?: manga.largeCoverUrl,
 			description = data.optJSONArray("description").toStringSet().joinToString("\n").nullIfEmpty()
 				?: manga.description,
 			chapters = getChapterList(id),
@@ -316,6 +320,7 @@ internal abstract class MangaBallParser(
 
 	private fun JSONObject.toManga(id: String): Manga {
 		val tags = optJSONArray("tags").toMangaTags()
+		val cover = extractCover()
 		return Manga(
 			id = generateUid(id),
 			title = optString("name").nullIfEmpty() ?: id,
@@ -328,10 +333,11 @@ internal abstract class MangaBallParser(
 			} else {
 				null
 			},
-			coverUrl = extractCover(),
+			coverUrl = cover,
 			tags = tags,
 			state = stateFromStatus(optString("status")),
 			authors = optJSONArray("author").toNameSet(),
+			largeCoverUrl = cover,
 			source = source,
 		)
 	}
@@ -367,10 +373,17 @@ internal abstract class MangaBallParser(
 	private fun JSONObject.extractCover(): String? {
 		val image = optJSONObject("image")
 		if (image != null) {
-			val fromImage = image.optNullableString("file")
-				?: image.optNullableString("cdn_mangadex")
+			// The site's own cover lives on the image CDN and is the only field that is present for
+			// almost every title. `image.file` is often a tiny Google thumbnail and `cdn_mangadex` is
+			// missing for a good share of titles, so prefer the local cover.
+			val path = image.optJSONObject("cover")?.optNullableString("path")
+			if (path != null) {
+				return if (path.startsWith("http")) path else "$COVER_BASE_URL/$path"
+			}
+			val fromImage = image.optNullableString("cdn_mangadex")
 				?: image.optNullableString("cdn_mangaupdate")
 				?: image.optNullableString("cdn_mangaupdates")
+				?: image.optNullableString("file")
 			if (fromImage != null) {
 				return fromImage
 			}
@@ -479,6 +492,12 @@ internal abstract class MangaBallParser(
 		private const val BASE_URL = "https://$DOMAIN"
 		private const val API_URL = "$BASE_URL/api/v1"
 		private const val PAGE_HOST_SUFFIX = ".poke-black-and-white.net"
+
+		/**
+		 * Host for the site's own covers (`image.cover.path`). Verified stable across titles.
+		 * These URLs require `Referer: https://mangaball.com/`, which [intercept] supplies.
+		 */
+		private const val COVER_BASE_URL = "https://bulbasaur$PAGE_HOST_SUFFIX/covers"
 		private val CHAPTER_PAGES_REGEX = Regex("""\\"pages\\":\[(.*?)\]""")
 		private val IMAGE_URL_REGEX = Regex("""https?://[^"\\\s]+""")
 		private val CHAPTER_TITLE_ID_REGEX = Regex("""\\"title\\":\{\\"id\\":\\"([a-fA-F0-9]{24})""")
