@@ -7,7 +7,7 @@ import org.koitharu.kotatsu.parsers.model.ContentType
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.site.madtheme.MadthemeParser
 
-@Broken
+@Broken("Redirects to ToonTop")
 @MangaSourceParser("BEEHENTAI", "BeeHentai", "en", ContentType.HENTAI)
 internal class BeeHentai(context: MangaLoaderContext) :
 	MadthemeParser(context, MangaParserSource.BEEHENTAI, "beehentai.com") {

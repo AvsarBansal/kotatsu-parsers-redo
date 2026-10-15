@@ -2,8 +2,7 @@ package org.koitharu.kotatsu.parsers.site.mangak
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import okhttp3.Interceptor
-import okhttp3.Response
+import okhttp3.HttpUrl
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -11,6 +10,7 @@ import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.json.mapJSON
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNullToSet
 import org.koitharu.kotatsu.parsers.util.json.mapJSONToSet
@@ -30,22 +30,20 @@ internal abstract class MangaKParser(
 
 	private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
 
+	/** Demographics the site's titles are tagged with; empty when its API has no such data. */
+	protected open val supportedDemographics: Set<Demographic> = EnumSet.of(
+		Demographic.SHOUJO,
+		Demographic.SEINEN,
+		Demographic.SHOUNEN,
+		Demographic.JOSEI,
+	)
+
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
 	}
 
-	override fun intercept(chain: Interceptor.Chain): Response {
-		val request = chain.request()
-		val response = chain.proceed(request)
-		if (!response.isSuccessful && request.url.host.matches(IMAGE_FALLBACK_REGEX)) {
-			response.close()
-			val newUrl = request.url.newBuilder().host(FALLBACK_IMAGE_HOST).build()
-			return chain.proceed(request.newBuilder().url(newUrl).build())
-		}
-		return response
-	}
-
+	// The API has no alphabetical order, and "added_date" answers with a server error.
 	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
 		SortOrder.UPDATED,
 		SortOrder.NEWEST,
@@ -54,7 +52,6 @@ internal abstract class MangaKParser(
 		SortOrder.POPULARITY_TODAY,
 		SortOrder.POPULARITY_WEEK,
 		SortOrder.POPULARITY_MONTH,
-		SortOrder.ALPHABETICAL,
 	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
@@ -68,23 +65,14 @@ internal abstract class MangaKParser(
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
 		availableTags = fetchTags(),
-		availableStates = EnumSet.of(
-			MangaState.ONGOING,
-			MangaState.FINISHED,
-			MangaState.PAUSED,
-			MangaState.ABANDONED,
-		),
+		// The site also shows hiatus and cancelled, but the API rejects them.
+		availableStates = EnumSet.of(MangaState.ONGOING, MangaState.FINISHED),
 		availableContentTypes = EnumSet.of(
 			ContentType.MANGA,
 			ContentType.MANHWA,
 			ContentType.MANHUA,
 		),
-		availableDemographics = EnumSet.of(
-			Demographic.SHOUJO,
-			Demographic.SEINEN,
-			Demographic.SHOUNEN,
-			Demographic.JOSEI,
-		),
+		availableDemographics = supportedDemographics,
 		availableContentRating = EnumSet.of(
 			ContentRating.SAFE,
 			ContentRating.SUGGESTIVE,
@@ -104,8 +92,6 @@ internal abstract class MangaKParser(
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val allExcludedTags = filter.tagsExclude.map { it.key }.toMutableSet()
-
 		val url = buildString {
 			append(apiUrl)
 			append("/titles/search?page=")
@@ -113,29 +99,24 @@ internal abstract class MangaKParser(
 			append("&limit=")
 			append(pageSize)
 
-			if (filter.query.isNullOrBlank()) {
-				when (order) {
-					SortOrder.POPULARITY -> append("&sort=views")
-					SortOrder.POPULARITY_TODAY -> append("&sort=views_today")
-					SortOrder.POPULARITY_WEEK -> append("&sort=views_7days")
-					SortOrder.POPULARITY_MONTH -> append("&sort=views_30days")
-					SortOrder.UPDATED -> append("&sort=latest")
-					SortOrder.NEWEST -> append("&sort=newest")
-					SortOrder.RATING -> append("&sort=rating")
-					SortOrder.ALPHABETICAL -> append("&sort=alphabetical")
-					else -> append("&sort=latest")
-				}
-			}
-
-			filter.query?.trim()?.takeIf { it.isNotEmpty() }?.let { q ->
-				val cleaned = q
-					.filter { it.isLetterOrDigit() || it == ' ' }
-					.trim()
-					.take(50)
-				if (cleaned.isNotEmpty()) {
-					append("&q=")
-					append(cleaned.urlEncoded())
-				}
+			val query = filter.query?.toSearchQuery()
+			if (query.isNullOrEmpty()) {
+				append("&sort=")
+				append(
+					when (order) {
+						SortOrder.POPULARITY -> "popular"
+						SortOrder.POPULARITY_TODAY -> "views_today"
+						SortOrder.POPULARITY_WEEK -> "views_7days"
+						SortOrder.POPULARITY_MONTH -> "views_30days"
+						SortOrder.NEWEST -> "newest"
+						SortOrder.RATING -> "rating"
+						else -> "latest"
+					},
+				)
+			} else {
+				// Without a sort, the API ranks results by relevance ("best match" on the site).
+				append("&q=")
+				append(query.urlEncoded())
 			}
 
 			filter.author?.trim()?.takeIf { it.isNotEmpty() }?.let { author ->
@@ -143,63 +124,49 @@ internal abstract class MangaKParser(
 				append(author.urlEncoded())
 			}
 
-			if (filter.tags.isNotEmpty()) {
-				append("&genres=")
-				append(filter.tags.joinToString(",") { it.key })
-			}
+			appendListParam("genres", filter.tags.map { it.key })
+			appendListParam("exclude", filter.tagsExclude.map { it.key })
 
-			if (allExcludedTags.isNotEmpty()) {
-				append("&exclude=")
-				append(allExcludedTags.joinToString(","))
-			}
-
-			filter.types.oneOrThrowIfMany()?.let {
-				append("&type=")
-				append(
+			// Types, content ratings and demographics take comma separated lists, matching any of them.
+			appendListParam(
+				"type",
+				filter.types.mapNotNull {
 					when (it) {
 						ContentType.MANGA -> "manga"
 						ContentType.MANHWA -> "manhwa"
 						ContentType.MANHUA -> "manhua"
-						else -> return@let
-					},
-				)
-			}
-
-			filter.contentRating.oneOrThrowIfMany()?.let {
-				append("&content_rating=")
-				append(
+						else -> null
+					}
+				},
+			)
+			appendListParam(
+				"content_rating",
+				filter.contentRating.map {
 					when (it) {
 						ContentRating.SAFE -> "safe"
 						ContentRating.SUGGESTIVE -> "suggestive"
-						ContentRating.ADULT -> "pornographic"
-					},
-				)
-			}
-
-			filter.demographics.oneOrThrowIfMany()?.let {
-				append("&demographic=")
-				append(
+						ContentRating.ADULT -> "erotica,pornographic"
+					}
+				},
+			)
+			appendListParam(
+				"demographic",
+				filter.demographics.mapNotNull {
 					when (it) {
 						Demographic.SHOUJO -> "shoujo"
 						Demographic.SEINEN -> "seinen"
 						Demographic.SHOUNEN -> "shounen"
 						Demographic.JOSEI -> "josei"
-						else -> return@let
-					},
-				)
-			}
+						else -> null
+					}
+				},
+			)
 
-			filter.states.oneOrThrowIfMany()?.let {
-				append("&status=")
-				append(
-					when (it) {
-						MangaState.ONGOING -> "ongoing"
-						MangaState.FINISHED -> "completed"
-						MangaState.PAUSED -> "hiatus"
-						MangaState.ABANDONED -> "cancelled"
-						else -> return@let
-					},
-				)
+			// The API takes a single status; both offered ones together are every title.
+			when (filter.states.singleOrNull()) {
+				MangaState.ONGOING -> append("&status=ongoing")
+				MangaState.FINISHED -> append("&status=completed")
+				else -> Unit
 			}
 		}
 
@@ -207,6 +174,32 @@ internal abstract class MangaKParser(
 		return json.getJSONObject("data").getJSONArray("items").mapJSON { item ->
 			item.toManga()
 		}
+	}
+
+	private fun StringBuilder.appendListParam(name: String, values: Collection<String>) {
+		if (values.isNotEmpty()) {
+			append('&')
+			append(name)
+			append('=')
+			append(values.joinToString(","))
+		}
+	}
+
+	/**
+	 * The API answers HTTP 400 to queries longer than [MAX_QUERY_LENGTH] characters (its message
+	 * claims 200), so long titles are cut after the last whole word that fits. Punctuation is fine.
+	 */
+	private fun String.toSearchQuery(): String {
+		val query = trim().replace(WHITESPACE_REGEX, " ")
+		if (query.length <= MAX_QUERY_LENGTH) {
+			return query
+		}
+		val words = query.take(MAX_QUERY_LENGTH + 1).substringBeforeLast(' ', "").trimEnd()
+		if (words.isNotEmpty()) {
+			return words
+		}
+		val cut = query.take(MAX_QUERY_LENGTH)
+		return if (cut.last().isHighSurrogate()) cut.dropLast(1) else cut
 	}
 
 	private fun JSONObject.toManga(): Manga {
@@ -218,7 +211,7 @@ internal abstract class MangaKParser(
 			url = getString("id"),
 			publicUrl = "https://$domain$relativeUrl",
 			rating = optDouble("rating", 0.0).toRating(),
-			contentRating = optString("content_rating").nullIfEmpty().toContentRating(),
+			contentRating = getStringOrNull("content_rating").toContentRating(),
 			coverUrl = optString("cover").nullIfEmpty(),
 			tags = parseTags(),
 			state = optString("status").toMangaState(),
@@ -226,13 +219,6 @@ internal abstract class MangaKParser(
 			description = optString("summary").nullIfEmpty(),
 			source = source,
 		)
-	}
-
-	private fun String?.toContentRating() = when (this) {
-		"safe" -> ContentRating.SAFE
-		"suggestive" -> ContentRating.SUGGESTIVE
-		"erotica", "pornographic" -> ContentRating.ADULT
-		else -> null
 	}
 
 	private fun JSONObject.parseAltTitles(): Set<String> {
@@ -252,6 +238,21 @@ internal abstract class MangaKParser(
 			MangaTag(genre.getString("name").toTitleCase(sourceLocale), slug, source)
 		}.orEmpty()
 
+	// Links carry the slug (https://<domain>/<slug>[/<chapter>]), while Manga.url is the API id.
+	override suspend fun resolveLink(resolver: LinkResolver, link: HttpUrl): Manga? {
+		if (link.host.removePrefix("www.") != domain) return null
+		val slug = link.pathSegments.firstOrNull()?.nullIfEmpty() ?: return null
+		val id = runCatchingCancellable {
+			webClient.httpGet("$apiUrl/titles/by-slug/${slug.urlEncoded()}").parseJson()
+				.getJSONObject("data")
+				.getString("new_url") // "/titles/<id>-<slug>"
+				.substringAfter("/titles/")
+				.substringBefore('/')
+				.substringBefore('-')
+		}.getOrNull()?.nullIfEmpty() ?: return null
+		return resolver.resolveManga(this, url = id)
+	}
+
 	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
 		val json = webClient.httpGet("$apiUrl/titles/${manga.url}").parseJson()
 			.getJSONObject("data").getJSONObject("title")
@@ -266,15 +267,6 @@ internal abstract class MangaKParser(
 			it.optString("name").nullIfEmpty()
 		}.orEmpty()
 
-		val contentRating = json.optString("content_rating").nullIfEmpty()?.let {
-			when (it) {
-				"safe" -> ContentRating.SAFE
-				"suggestive" -> ContentRating.SUGGESTIVE
-				"erotica", "pornographic" -> ContentRating.ADULT
-				else -> null
-			}
-		}
-
 		manga.copy(
 			title = json.optString("name").nullIfEmpty() ?: manga.title,
 			altTitles = json.parseAltTitles().ifEmpty { manga.altTitles },
@@ -283,7 +275,7 @@ internal abstract class MangaKParser(
 			authors = authors + artists,
 			state = json.optString("status").toMangaState() ?: manga.state,
 			rating = json.optDouble("rating", 0.0).toRating(),
-			contentRating = contentRating ?: manga.contentRating,
+			contentRating = json.getStringOrNull("content_rating").toContentRating() ?: manga.contentRating,
 			chapters = chaptersDeferred.await(),
 		)
 	}
@@ -332,6 +324,13 @@ internal abstract class MangaKParser(
 
 	private fun Double.toRating() = if (this > 0.0) (this / 5.0).toFloat() else RATING_UNKNOWN
 
+	private fun String?.toContentRating() = when (this) {
+		"safe" -> ContentRating.SAFE
+		"suggestive" -> ContentRating.SUGGESTIVE
+		"erotica", "pornographic" -> ContentRating.ADULT
+		else -> null
+	}
+
 	private fun String?.toMangaState() = when (this?.lowercase(Locale.US)) {
 		"ongoing" -> MangaState.ONGOING
 		"completed" -> MangaState.FINISHED
@@ -340,8 +339,10 @@ internal abstract class MangaKParser(
 		else -> null
 	}
 
-	companion object {
-		private const val FALLBACK_IMAGE_HOST = "rx.rzyn.net"
-		private val IMAGE_FALLBACK_REGEX = Regex("rx\\.qvzr[a-z]\\.org")
+	private companion object {
+
+		const val MAX_QUERY_LENGTH = 50
+
+		val WHITESPACE_REGEX = Regex("\\s+")
 	}
 }
