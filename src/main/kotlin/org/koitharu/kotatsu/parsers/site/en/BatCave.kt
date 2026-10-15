@@ -414,17 +414,8 @@ internal class BatCave(context: MangaLoaderContext) :
 
 		val dateFormat = SimpleDateFormat("dd.MM.yyyy", Locale.US)
 
-		val scriptData = doc.selectFirst("script:containsData(__DATA__)")?.data()
-			?.let { data ->
-				val jsonStart = data.indexOf("window.__DATA__ = ") + "window.__DATA__ = ".length
-				val jsonEnd = data.indexOf("};", startIndex = jsonStart)
-				if (jsonEnd != -1) {
-					// substring, include "}" symbol
-					data.substring(jsonStart, jsonEnd + 1)
-				} else {
-					null
-				}
-			} ?: doc.parseFailed("Script data not found")
+		val scriptData = extractScriptJson(doc, "__DATA__")
+			?: doc.parseFailed("Script data not found")
 
 		val jsonData = JSONObject(scriptData)
 		val newsId = jsonData.getLong("news_id")
@@ -480,6 +471,49 @@ internal class BatCave(context: MangaLoaderContext) :
 		)
 	}
 
+	/**
+	 * Finds `window.<varName> = {...}` (or `<varName>={...}`, with or without a trailing semicolon)
+	 * in any inline script, or a JSON script tag whose id contains the name, and returns the object
+	 * as a string. Braces are matched properly, so a "};" inside a chapter title can't cut it short.
+	 */
+	private fun extractScriptJson(doc: Document, varName: String): String? {
+		val assignment = Regex("""(?:window\.)?${Regex.escape(varName)}\s*=\s*""")
+		for (script in doc.select("script")) {
+			val data = script.data()
+			val match = assignment.find(data) ?: continue
+			val start = data.indexOf('{', match.range.last + 1)
+			if (start < 0) continue
+			extractBalancedObject(data, start)?.let { return it }
+		}
+		doc.selectFirst("script[type=application/json][id*=${varName.trim('_')}]")
+			?.data()?.trim()?.takeIf { it.startsWith("{") }
+			?.let { return it }
+		return null
+	}
+
+	private fun extractBalancedObject(text: String, start: Int): String? {
+		var depth = 0
+		var quote = 0.toChar()
+		var escaped = false
+		for (i in start until text.length) {
+			val c = text[i]
+			if (quote != 0.toChar()) {
+				when {
+					escaped -> escaped = false
+					c == '\\' -> escaped = true
+					c == quote -> quote = 0.toChar()
+				}
+				continue
+			}
+			when (c) {
+				'"', '\'' -> quote = c
+				'{' -> depth++
+				'}' -> if (--depth == 0) return text.substring(start, i + 1)
+			}
+		}
+		return null
+	}
+
 	private companion object {
 
 		const val DLE_GUARD_COOKIE = "__guard_trust"
@@ -488,15 +522,10 @@ internal class BatCave(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = captureDocument(chapter.url.toAbsoluteUrl(domain))
-		val data = doc.selectFirst("script:containsData(__DATA__)")?.data()
-			?.substringAfter("=")
-			?.trim()
-			?.removeSuffix(";")
-			?.substringAfter("\"images\":[")
-			?.substringBefore("]")
-			?.split(",")
-			?.map { it.trim().removeSurrounding("\"").replace("\\", "") }
+		val imagesJson = extractScriptJson(doc, "__DATA__")
+			?.let { JSONObject(it).optJSONArray("images") }
 			?: throw ParseException("Image data not found", chapter.url)
+		val data = List(imagesJson.length()) { i -> imagesJson.getString(i) }
 
 		return data.map { imageUrl ->
 			MangaPage(
