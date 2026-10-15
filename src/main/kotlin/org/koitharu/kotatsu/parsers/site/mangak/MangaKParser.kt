@@ -282,24 +282,43 @@ internal abstract class MangaKParser(
 
 	private suspend fun fetchChapters(id: String, cv: Long): List<MangaChapter> {
 		val json = webClient.httpGet("$apiUrl/titles/$id/chapters?cv=$cv").parseJson()
+		// The API lists newest first; the app expects oldest first.
 		val chapters = json.getJSONObject("data").getJSONArray("chapters").mapJSON { it }
-		val total = chapters.size
+			.distinctBy { it.getString("id") }
+			.asReversed()
+		val usedIds = HashSet<Long>(chapters.size)
 		return chapters.mapIndexed { index, chapter ->
+			val url = chapter.getString("url")
 			MangaChapter(
-				id = generateUid(chapter.getString("id")),
+				id = uniqueChapterId(chapter.getString("id"), url, usedIds),
 				title = chapter.optString("name").nullIfEmpty(),
 				number = chapter.optDouble("chapter_number", Double.NaN)
 					.takeUnless { it.isNaN() }
 					?.toFloat()
-					?: (total - index).toFloat(),
+					?: (index + 1).toFloat(),
 				volume = 0,
-				url = chapter.getString("url"),
+				url = url,
 				scanlator = null,
 				uploadDate = dateFormat.parseSafe(chapter.optString("updated_at").substringBefore('.')),
 				branch = null,
 				source = source,
 			)
-		}.reversed()
+		}
+	}
+
+	/**
+	 * [generateUid] is a polynomial hash, and the chapter ids of a title share a prefix, so ids that
+	 * differ in two neighbouring characters collide ("QDwlnxN2" and "QDwlnwm2"). Called oldest first,
+	 * the first chapter keeps its id based uid, so existing ids don't change; later ones use the url.
+	 */
+	private fun uniqueChapterId(apiId: String, url: String, usedIds: MutableSet<Long>): Long {
+		var id = generateUid(apiId)
+		var attempt = 0
+		while (!usedIds.add(id)) {
+			id = generateUid(if (attempt == 0) url else "$url#$attempt")
+			attempt++
+		}
+		return id
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
