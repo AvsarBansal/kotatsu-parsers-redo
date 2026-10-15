@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.en
 
 import org.json.JSONObject
 import org.jsoup.nodes.Document
+import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -38,6 +39,7 @@ import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.LinkedHashSet
 
+@Broken("Redirect to SilentQuill")
 @MangaSourceParser("KDTSCANS", "KdtScans", "en")
 internal class KdtScans(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.KDTSCANS, 20) {
