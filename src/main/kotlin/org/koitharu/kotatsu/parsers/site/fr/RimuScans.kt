@@ -3,7 +3,6 @@ package org.koitharu.kotatsu.parsers.site.fr
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
-import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -32,7 +31,6 @@ import java.util.EnumSet
 import java.util.Locale
 import java.util.TimeZone
 
-@Broken
 @MangaSourceParser("RIMUSCANS", "RimuScans", "fr")
 internal class RimuScans(context: MangaLoaderContext) :
 	SinglePageMangaParser(context, MangaParserSource.RIMUSCANS) {
@@ -186,35 +184,172 @@ internal class RimuScans(context: MangaLoaderContext) :
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		val blob = decodePayload(doc)
 		val objects = extractMangaObjects(blob)
+		// The ComicSeries JSON-LD is the stable source for the redesigned detail page:
+		// it carries the synopsis, genres, authors and a complete chapter list.
+		val ld = parseComicSeriesLd(doc)
 
 		// Pick the object matching this slug, else the one carrying the most chapters.
+		// The redesigned page no longer embeds this object, so it is often null.
 		val detail = objects.firstOrNull { it.optString("slug") == slug }
 			?: objects.maxByOrNull { it.optJSONArray("chapters")?.length() ?: 0 }
 
-		// The full chapter list may be nested in the manga object or held in a standalone
-		// RSC node; use whichever is longest so a truncated preview can't win.
-		val nested = detail?.optJSONArray("chapters")
-		val standalone = findLargestChaptersArray(blob)
-		val chaptersArray = listOfNotNull(nested, standalone).maxByOrNull { it.length() }
-		val chapters = chaptersArray?.let { parseChapters(it, slug) }.orEmpty()
+		// Chapters: the embedded RSC array now replaces the most recent entries with
+		// back-reference strings, so it is incomplete. Prefer the JSON-LD hasPart list
+		// (complete + clean), dropping premium/unpublished chapters detected in the RSC
+		// payload; fall back to the RSC array only if the JSON-LD is missing.
+		val excluded = collectExcludedChapterNumbers(blob)
+		val chapters = parseChaptersFromLd(ld, slug, excluded).ifEmpty {
+			val nested = detail?.optJSONArray("chapters")
+			val standalone = findLargestChaptersArray(blob)
+			val chaptersArray = listOfNotNull(nested, standalone).maxByOrNull { it.length() }
+			chaptersArray?.let { parseChapters(it, slug) }.orEmpty()
+		}
+
+		// Synopsis: read from the JSON-LD first (the full manga object is no longer
+		// embedded), then the RSC object, then the value carried over from the list.
+		val ldDescription = ld?.getStringOrNull("description")?.trim()
+			?.takeIf { it.isNotEmpty() && it != "null" }
 
 		val enriched = detail?.let { json ->
 			val cover = json.getStringOrNull("cover")?.takeIf { it.isNotBlank() && it != "null" }
 				?.let { optimizedImageUrl(it, COVER_WIDTH) }
 			manga.copy(
 				coverUrl = cover ?: manga.coverUrl,
-				description = json.getStringOrNull("description")?.takeIf { it.isNotBlank() && it != "null" }
+				description = ldDescription
+					?: json.getStringOrNull("description")?.takeIf { it.isNotBlank() && it != "null" }
 					?: manga.description,
-				tags = parseGenres(json).ifEmpty { manga.tags },
+				tags = parseGenres(json).ifEmpty { parseLdGenres(ld).ifEmpty { manga.tags } },
 				state = parseStatus(json.getStringOrNull("status")) ?: manga.state,
 				authors = buildSet {
 					addAll(splitNames(json.getStringOrNull("author")))
 					addAll(splitNames(json.getStringOrNull("artist")))
-				}.ifEmpty { manga.authors },
+				}.ifEmpty { parseLdAuthors(ld).ifEmpty { manga.authors } },
 			)
-		} ?: manga
+		} ?: manga.copy(
+			description = ldDescription ?: manga.description,
+			tags = parseLdGenres(ld).ifEmpty { manga.tags },
+			authors = parseLdAuthors(ld).ifEmpty { manga.authors },
+		)
 
 		return enriched.copy(chapters = chapters)
+	}
+
+	/** Returns the `ComicSeries` JSON-LD object embedded in the detail page, if present. */
+	private fun parseComicSeriesLd(doc: Document): JSONObject? {
+		for (script in doc.select("script")) {
+			if (!script.attr("type").equals("application/ld+json", ignoreCase = true)) continue
+			val raw = script.data().trim()
+			if (raw.isEmpty() || !raw.startsWith("{")) continue
+			try {
+				val json = JSONObject(raw)
+				if (json.optString("@type").equals("ComicSeries", ignoreCase = true)) return json
+			} catch (_: Exception) {
+				// ignore non-object / malformed JSON-LD blocks
+			}
+		}
+		return null
+	}
+
+	private fun parseLdGenres(ld: JSONObject?): Set<MangaTag> {
+		val arr = ld?.optJSONArray("genre") ?: return emptySet()
+		val out = LinkedHashSet<MangaTag>()
+		for (i in 0 until arr.length()) {
+			val name = arr.optString(i).trim()
+			if (name.isNotEmpty() && name != "null") {
+				out.add(MangaTag(key = name.lowercase(sourceLocale), title = name, source = source))
+			}
+		}
+		return out
+	}
+
+	private fun parseLdAuthors(ld: JSONObject?): Set<String> {
+		if (ld == null) return emptySet()
+		val out = LinkedHashSet<String>()
+		for (key in arrayOf("author", "illustrator")) {
+			val name = ld.optJSONObject(key)?.getStringOrNull("name")?.trim()
+			if (!name.isNullOrEmpty() && name != "null" && !name.equals("N/A", ignoreCase = true)) {
+				out.add(name)
+			}
+		}
+		return out
+	}
+
+	/**
+	 * Builds the chapter list from the ComicSeries JSON-LD `hasPart` array. The chapter
+	 * number is taken from the reader URL (handles decimals), and any number flagged as
+	 * premium/unpublished in the RSC payload is skipped.
+	 */
+	private fun parseChaptersFromLd(ld: JSONObject?, slug: String, exclude: Set<String>): List<MangaChapter> {
+		val hasPart = ld?.optJSONArray("hasPart") ?: return emptyList()
+		val result = ArrayList<MangaChapter>(hasPart.length())
+		val seen = HashSet<String>()
+		for (i in 0 until hasPart.length()) {
+			val ch = hasPart.optJSONObject(i) ?: continue
+			if (!ch.optString("@type").equals("Chapter", ignoreCase = true)) continue
+			val url = ch.getStringOrNull("url")?.trim().orEmpty()
+			val numberKey = url.substringAfterLast('/').trim()
+			if (numberKey.isEmpty() || !seen.add(numberKey) || exclude.contains(numberKey)) continue
+			val number = numberKey.toFloatOrNull() ?: continue
+			if (number < 0f) continue
+
+			val chapterUrl = "/read/$slug/$numberKey"
+			val rawName = ch.getStringOrNull("name")?.substringAfterLast(" - ")?.trim()
+				?.takeIf { it.isNotEmpty() && it != "null" }
+			val title = when {
+				rawName == null -> "Chapitre $numberKey"
+				rawName.startsWith("Chapitre", ignoreCase = true) -> rawName
+				else -> "Chapitre $numberKey - $rawName"
+			}
+
+			result.add(
+				MangaChapter(
+					id = generateUid(chapterUrl),
+					title = title,
+					number = number,
+					volume = 0,
+					url = chapterUrl,
+					uploadDate = parseDate(ch.getStringOrNull("datePublished")),
+					source = source,
+					scanlator = null,
+					branch = null,
+				),
+			)
+		}
+		return result.sortedBy { it.number }
+	}
+
+	/** Collects chapter numbers flagged premium/unpublished anywhere in the RSC payload. */
+	private fun collectExcludedChapterNumbers(blob: String): Set<String> {
+		val excluded = HashSet<String>()
+		val marker = "\"chapters\":["
+		var idx = 0
+		while (true) {
+			val at = blob.indexOf(marker, idx)
+			if (at == -1) break
+			val arrStart = at + marker.length - 1 // position of '['
+			val arrStr = extractJsonArrayString(blob, arrStart)
+			if (arrStr == null) {
+				idx = at + marker.length
+				continue
+			}
+			try {
+				val arr = JSONArray(arrStr)
+				for (i in 0 until arr.length()) {
+					val c = arr.optJSONObject(i) ?: continue
+					val premium = c.optString("type").equals("PREMIUM", ignoreCase = true)
+					val status = c.getStringOrNull("status")
+					val unpublished = status != null && !status.equals("PUBLISHED", ignoreCase = true)
+					if (premium || unpublished) {
+						val number = c.optDouble("number", -1.0).toFloat()
+						if (number >= 0f) excluded.add(formatChapterNumber(number))
+					}
+				}
+			} catch (_: Exception) {
+				// ignore malformed
+			}
+			idx = arrStart + arrStr.length
+		}
+		return excluded
 	}
 
 	private fun parseChapters(chaptersArray: JSONArray, slug: String): List<MangaChapter> {
@@ -258,7 +393,7 @@ internal class RimuScans(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
 
-		// The reader renders each page as <img src="/uploads/mangas/{slug}/chapters/{n}/NNN.jpg?v=...">.
+		// The reader renders each page as <img src="/uploads/mangas/{slug}/chapters/{n}/NNN.webp?v=...">.
 		// The credits page lives under /uploads/credits/ and is excluded by the selector.
 		// Pages are served through the Next.js image optimizer so they arrive as WebP: this
 		// dodges buggy hardware JPEG decoders (e.g. MediaTek libjpeg-alpha) and cuts bandwidth.
@@ -281,10 +416,13 @@ internal class RimuScans(context: MangaLoaderContext) :
 	 * which serves WebP/AVIF instead of the original JPEG.
 	 */
 	private fun optimizedImageUrl(path: String, width: Int): String {
+		// Drop any cache-busting query (?v=...) or fragment before encoding: the Next.js
+		// optimizer returns HTTP 400 when they are folded into its `url` parameter.
+		val clean = path.substringBefore('?').substringBefore('#').trim()
 		val relative = when {
-			path.startsWith("http", ignoreCase = true) -> "/" + path.substringAfter("://").substringAfter('/')
-			path.startsWith("/") -> path
-			else -> "/$path"
+			clean.startsWith("http", ignoreCase = true) -> "/" + clean.substringAfter("://").substringAfter('/')
+			clean.startsWith("/") -> clean
+			else -> "/$clean"
 		}
 		val encoded = URLEncoder.encode(relative, "UTF-8")
 		return "https://$domain/_next/image?url=$encoded&w=$width&q=75"
