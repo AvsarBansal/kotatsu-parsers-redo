@@ -22,8 +22,6 @@ internal class Mgkomik(context: MangaLoaderContext) :
 	override val datePattern = "dd MMM yy"
 	override val stylePage = ""
 	override val sourceLocale: Locale = Locale.ENGLISH
-	override val withoutAjax = true
-	override val postReq = true
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
 		.add("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
