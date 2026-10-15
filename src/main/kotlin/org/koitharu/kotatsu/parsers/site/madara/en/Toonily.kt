@@ -3,13 +3,14 @@ package org.koitharu.kotatsu.parsers.site.madara.en
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.*
+import java.text.Normalizer
 import java.util.EnumSet
+import java.util.Locale
 
 @MangaSourceParser("TOONILY", "Toonily", "en")
 internal class Toonily(context: MangaLoaderContext) :
@@ -19,12 +20,17 @@ internal class Toonily(context: MangaLoaderContext) :
 	override val datePattern = "MMM d, yy"
 	override val withoutAjax = true
 	override val authorSearchSupported = true
-	override val selectGenre = "div.genres-content a, div.wp-manga-tags-list a"
 
 	init {
 		paginator.firstPage = 1
 		searchPaginator.firstPage = 1
+		// Without it the site hides its mature titles (most of the catalogue) from listings and search
+		context.cookieJar.insertCookies(domain, "toonily-mature=1")
 	}
+
+	// The search page has no release year filter
+	override val filterCapabilities: MangaListFilterCapabilities
+		get() = super.filterCapabilities.copy(isYearSupported = false)
 
 	override suspend fun getFilterOptions() = super.getFilterOptions().copy(
 		availableStates = EnumSet.of(
@@ -33,6 +39,8 @@ internal class Toonily(context: MangaLoaderContext) :
 			MangaState.ABANDONED,
 			MangaState.PAUSED,
 		),
+		// The site's "Family Friendly" filter (adult=0) only matches a handful of titles
+		availableContentRating = EnumSet.of(ContentRating.ADULT),
 	)
 
 	override suspend fun fetchAvailableTags(): Set<MangaTag> {
@@ -50,55 +58,42 @@ internal class Toonily(context: MangaLoaderContext) :
 		return tags.ifEmpty { super.fetchAvailableTags() }
 	}
 
-	override suspend fun createMangaTag(a: Element): MangaTag? {
-		val title = a.text().removePrefix("#").trim()
-		return super.createMangaTag(a)?.copy(title = title.toTitleCase())
-	}
-
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val url = buildString {
-			append("https://")
-			append(domain)
+		// Same paths as the site's own pager: /search/[<query slug>/][page/<n>/]
+		val url = urlBuilder().apply {
+			addPathSegment("search")
+			val slug = filter.query?.toSearchSlug()
+			if (!slug.isNullOrEmpty()) {
+				addPathSegment(slug)
+			}
 			if (page > 1) {
-				append("/search/page/")
-				append(page)
-				append('/')
-			} else {
-				append("/search/")
+				addPathSegment("page")
+				addPathSegment(page.toString())
 			}
+			addPathSegment("")
 
-			val queryParams = mutableListOf<String>()
-
-			if (!filter.query.isNullOrEmpty()) {
-				queryParams.add("s=${filter.query.urlEncoded()}")
-				queryParams.add("post_type=wp-manga")
-			}
-
-			if (!filter.author.isNullOrEmpty()) {
-				queryParams.add("author=${filter.author.urlEncoded()}")
+			if (!filter.author.isNullOrBlank()) {
+				addQueryParameter("author", filter.author)
 			}
 
 			filter.tags.forEachIndexed { i, tag ->
-				queryParams.add("genre%5B$i%5D=${tag.key.urlEncoded()}")
+				addQueryParameter("genre[$i]", tag.key)
 			}
 
-			filter.states.forEachIndexed { i, state ->
-				val value = when (state) {
+			filter.states.mapNotNull { state ->
+				when (state) {
 					MangaState.ONGOING -> "on-going"
 					MangaState.FINISHED -> "end"
 					MangaState.ABANDONED -> "canceled"
 					MangaState.PAUSED -> "on-hold"
 					else -> null
 				}
-				if (value != null) {
-					queryParams.add("status%5B$i%5D=$value")
-				}
+			}.forEachIndexed { i, value ->
+				addQueryParameter("status[$i]", value)
 			}
 
-			when (filter.contentRating.oneOrThrowIfMany()) {
-				ContentRating.SAFE -> queryParams.add("adult=0")
-				ContentRating.ADULT -> queryParams.add("adult=1")
-				else -> Unit
+			if (filter.contentRating.oneOrThrowIfMany() == ContentRating.ADULT) {
+				addQueryParameter("adult", "1")
 			}
 
 			val orderParam = when (order) {
@@ -107,18 +102,13 @@ internal class Toonily(context: MangaLoaderContext) :
 				SortOrder.RATING -> "rating"
 				SortOrder.NEWEST -> "new-manga"
 				SortOrder.ALPHABETICAL -> "alphabet"
-				SortOrder.RELEVANCE -> ""
+				SortOrder.RELEVANCE -> null
 				else -> "latest"
 			}
-			if (orderParam.isNotEmpty()) {
-				queryParams.add("m_orderby=$orderParam")
+			if (orderParam != null) {
+				addQueryParameter("m_orderby", orderParam)
 			}
-
-			if (queryParams.isNotEmpty()) {
-				append('?')
-				append(queryParams.joinToString("&"))
-			}
-		}
+		}.build()
 		val doc = webClient.httpGet(url).parseHtml()
 		return parseMangaList(doc)
 	}
@@ -157,6 +147,7 @@ internal class Toonily(context: MangaLoaderContext) :
 		val fullUrl = manga.url.toAbsoluteUrl(domain)
 		val doc = webClient.httpGet(fullUrl).parseHtml()
 
+		// Old /webtoon/<slug>/ urls redirect to /serie/<slug>-<hash>/: keep the saved url (and so the id) as is
 		val href = doc.selectFirst("head meta[property='og:url']")?.attr("content")?.toRelativeUrl(domain) ?: manga.url
 
 		val chaptersDeferred = if (doc.select(selectTestAsync).isEmpty()) {
@@ -198,7 +189,6 @@ internal class Toonily(context: MangaLoaderContext) :
 
 		manga.copy(
 			title = title,
-			url = href,
 			publicUrl = href.toAbsoluteUrl(domain),
 			rating = rating,
 			tags = tags,
@@ -209,5 +199,28 @@ internal class Toonily(context: MangaLoaderContext) :
 			chapters = chaptersDeferred.await(),
 			contentRating = if (isAdult || isNsfwSource) ContentRating.ADULT else ContentRating.SAFE,
 		)
+	}
+
+	// The site redirects ?s=<query> to /search/<slug>/, the slug being WordPress' sanitize_title() of the query
+	private fun String.toSearchSlug(): String = Normalizer.normalize(lowercase(Locale.ROOT), Normalizer.Form.NFD)
+		.replace(diacriticsRegex, "")
+		.replace("æ", "ae")
+		.replace("œ", "oe")
+		.replace("ø", "o")
+		.replace("ß", "s")
+		.replace(htmlEntityRegex, "")
+		.replace(dashLikeRegex, " ")
+		.replace(slugDropRegex, "")
+		.trim()
+		.replace(slugSeparatorRegex, "-")
+		.trim('-')
+
+	private companion object {
+
+		val diacriticsRegex = Regex("\\p{Mn}+")
+		val htmlEntityRegex = Regex("&#?[a-z0-9]+;")
+		val dashLikeRegex = Regex("[./\\u00A0\\u2013\\u2014]")
+		val slugDropRegex = Regex("[^\\p{L}\\p{N}\\s_-]")
+		val slugSeparatorRegex = Regex("[\\s-]+")
 	}
 }
