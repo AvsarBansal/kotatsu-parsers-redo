@@ -1,15 +1,16 @@
 package org.koitharu.kotatsu.parsers.site.fr
 
-import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
-import org.jsoup.Jsoup
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.NotFoundException
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.ContentRating
+import org.koitharu.kotatsu.parsers.model.ContentType
 import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
 import org.koitharu.kotatsu.parsers.model.MangaListFilter
@@ -21,156 +22,158 @@ import org.koitharu.kotatsu.parsers.model.MangaState
 import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
 import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.util.LinkResolver
 import org.koitharu.kotatsu.parsers.util.generateUid
+import org.koitharu.kotatsu.parsers.util.json.getBooleanOrDefault
+import org.koitharu.kotatsu.parsers.util.json.getFloatOrDefault
+import org.koitharu.kotatsu.parsers.util.json.getIntOrDefault
 import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.json.mapJSON
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
+import org.koitharu.kotatsu.parsers.util.json.toJSONArrayOrNull
+import org.koitharu.kotatsu.parsers.util.json.toJSONObjectOrNull
 import org.koitharu.kotatsu.parsers.util.json.unescapeJson
+import org.koitharu.kotatsu.parsers.util.nl2br
 import org.koitharu.kotatsu.parsers.util.oneOrThrowIfMany
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseRaw
+import org.koitharu.kotatsu.parsers.util.runCatchingCancellable
+import org.koitharu.kotatsu.parsers.util.toTitleCase
+import org.koitharu.kotatsu.parsers.util.urlBuilder
+import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
 import java.util.TimeZone
 
 /**
- * Aniverse (ex RaijinScans) — aniverse.fr
+ * Aniverse (aniverse.fr), formerly RaijinScans: raijin-scans.fr redirects there and most slugs were kept,
+ * so manga urls keep RaijinScans' `/manga/{slug}/` format and the ids of library entries don't change.
  *
- * Le site (Next.js) expose des API JSON publiques :
- *  - `/api/manga?page=N[&genre=...]` — catalogue (tri par date du dernier chapitre)
- *  - `/api/manga/reader?manga={slug}&chapter={uuid}` — chapitres + pages d'un chapitre
- *  - `/api/manga/known?alIds=...` — correspondance AniList → titres du site
- * Les pages HTML embarquent aussi le payload RSC (Next.js) avec l'objet manga complet
- * (titre, auteurs, genres, description, note) et la liste intégrale des chapitres.
- *
- * La recherche du site web est hors service (résultats jamais chargés) : la recherche
- * passe donc par l'API publique AniList puis par `/api/manga/known` pour ne conserver
- * que les titres réellement disponibles sur Aniverse.
+ * The site (Next.js) has public JSON APIs:
+ *  - `/api/manga?page=N[&genre=X]`: catalogue ordered by latest chapter, one genre at most;
+ *  - `/api/anime/search?media=manga`: search, sorts and filters (genres, status, origin, format);
+ *  - `/api/manga/reader?manga={slug}&chapter={uuid}`: pages of a chapter, plus the whole chapter list.
+ * Details and the chapter list come from the RSC payload of `/manga/{slug}`.
  */
-@MangaSourceParser("ANIVERSE", "Aniverse", "fr")
+@MangaSourceParser("RAIJINSCANS", "Aniverse", "fr")
 internal class Aniverse(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.ANIVERSE, pageSize = PAGE_SIZE, searchPageSize = SEARCH_PAGE_SIZE) {
+	PagedMangaParser(context, MangaParserSource.RAIJINSCANS, pageSize = PAGE_SIZE) {
 
 	override val configKeyDomain = ConfigKey.Domain("aniverse.fr")
 
-	override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.UPDATED)
+	override val availableSortOrders: Set<SortOrder> = EnumSet.of(
+		SortOrder.UPDATED,
+		SortOrder.POPULARITY,
+		SortOrder.RATING,
+		SortOrder.NEWEST,
+		SortOrder.ALPHABETICAL,
+		SortOrder.RELEVANCE,
+	)
 
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = MangaListFilterCapabilities(
-			isMultipleTagsSupported = false,
+			isMultipleTagsSupported = true,
 			isSearchSupported = true,
+			isSearchWithFiltersSupported = true,
 		)
 
-	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
-		availableTags = TAGS,
-	)
-
-	private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-		timeZone = TimeZone.getTimeZone("UTC")
+	private val genres: Set<MangaTag> = GENRES.mapTo(LinkedHashSet()) { (key, title) ->
+		MangaTag(title = title, key = key, source = source)
 	}
 
-	private val jsonHeaders: Headers = Headers.Builder()
-		.add("Content-Type", "application/json")
-		.add("Accept", "application/json")
-		.build()
-
-	private var flightCache: Pair<String, String>? = null
+	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
+		availableTags = genres,
+		availableStates = EnumSet.of(
+			MangaState.ONGOING,
+			MangaState.FINISHED,
+			MangaState.PAUSED,
+			MangaState.ABANDONED,
+		),
+		availableContentTypes = EnumSet.of(
+			ContentType.MANGA,
+			ContentType.MANHWA,
+			ContentType.MANHUA,
+			ContentType.ONE_SHOT,
+		),
+	)
 
 	// ---------------------------------------------------------------- list
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val query = filter.query?.trim()
-		if (!query.isNullOrEmpty()) {
-			return search(query, page)
+		val query = filter.query?.trim().orEmpty()
+		val isCatalogue = order == SortOrder.UPDATED && query.isEmpty() && filter.tags.size <= 1 &&
+			filter.states.isEmpty() && filter.types.isEmpty()
+		if (isCatalogue) {
+			val url = urlBuilder()
+				.addPathSegments("api/manga")
+				.addQueryParameter("page", page.toString())
+			filter.tags.firstOrNull()?.let { url.addQueryParameter("genre", it.key) }
+			return webClient.httpGet(url.build()).parseJson()
+				.getJSONArray("items")
+				.mapJSON { it.toManga() }
 		}
-		val url = "https://$domain/api/manga".toHttpUrl().newBuilder()
+		val url = urlBuilder()
+			.addPathSegments("api/anime/search")
+			.addQueryParameter("media", "manga")
 			.addQueryParameter("page", page.toString())
-			.apply {
-				filter.tags.oneOrThrowIfMany()?.let { addQueryParameter("genre", it.key) }
-			}
-			.build()
-		return webClient.httpGet(url).parseJson()
-			.getJSONArray("items")
-			.mapJSON { it.toListManga() }
+			.addQueryParameter("pageSize", PAGE_SIZE.toString())
+		if (query.isNotEmpty()) {
+			url.addQueryParameter("q", query)
+		}
+		// Without a sort the site orders by relevance with a query and by popularity otherwise.
+		// That is also the fallback for UPDATED, which only the catalogue (no search, one genre) supports.
+		when (order) {
+			SortOrder.POPULARITY -> "popularity"
+			SortOrder.RATING -> "rating"
+			SortOrder.NEWEST -> "newest"
+			SortOrder.ALPHABETICAL -> "title"
+			else -> null
+		}?.let { url.addQueryParameter("sort", it) }
+		filter.tags.forEach { url.addQueryParameter("genres", it.key) }
+		filter.states.forEach { state ->
+			when (state) {
+				MangaState.ONGOING -> "Ongoing"
+				MangaState.FINISHED -> "Finished"
+				MangaState.PAUSED -> "On hiatus"
+				MangaState.ABANDONED -> "Cancelled"
+				else -> null
+			}?.let { url.addQueryParameter("status", it) }
+		}
+		if (ContentType.ONE_SHOT in filter.types) {
+			url.addQueryParameter("type", "One-shot")
+		}
+		// The origin ("kind") accepts a single value.
+		val kind = filter.types.filterTo(EnumSet.noneOf(ContentType::class.java)) { it != ContentType.ONE_SHOT }
+			.oneOrThrowIfMany()
+		when (kind) {
+			ContentType.MANGA -> "manga"
+			ContentType.MANHWA -> "manhwa"
+			ContentType.MANHUA -> "manhua"
+			else -> null
+		}?.let { url.addQueryParameter("kind", it) }
+		return webClient.httpGet(url.build()).parseJson()
+			.getJSONArray("data")
+			.mapJSON { it.toManga() }
 	}
 
-	/**
-	 * Recherche via AniList (public) croisée avec /api/manga/known.
-	 */
-	private suspend fun search(query: String, page: Int): List<Manga> {
-		val gqlQuery = buildString {
-			append("query { Page(page: ")
-			append(page)
-			append(", perPage: ")
-			append(SEARCH_PAGE_SIZE)
-			append(") { media(search: ")
-			append(JSONObject.quote(query))
-			append(", type: MANGA, sort: SEARCH_MATCH) { id title { romaji english native userPreferred } coverImage { large } } } }")
-		}
-		val payload = JSONObject().apply {
-			put("query", gqlQuery)
-		}
-		val media = webClient.httpPost(ANILIST_URL.toHttpUrl(), payload, jsonHeaders)
-			.parseJson()
-			.getJSONObject("data")
-			.getJSONObject("Page")
-			.getJSONArray("media")
-		if (media.length() == 0) {
-			return emptyList()
-		}
-		val alIds = ArrayList<String>(media.length())
-		for (i in 0 until media.length()) {
-			media.optJSONObject(i)?.optInt("id")?.takeIf { it > 0 }?.let { alIds.add(it.toString()) }
-		}
-		if (alIds.isEmpty()) {
-			return emptyList()
-		}
-		val known = webClient.httpGet("https://$domain/api/manga/known?alIds=${alIds.joinToString(",")}")
-			.parseJson()
-			.getJSONArray("items")
-		if (known.length() == 0) {
-			return emptyList()
-		}
-		val byAlId = HashMap<Int, JSONObject>(known.length())
-		for (i in 0 until known.length()) {
-			val jo = known.getJSONObject(i)
-			byAlId[jo.getInt("alId")] = jo
-		}
-		return media.mapJSONNotNull { jo ->
-			val entry = byAlId[jo.optInt("id")] ?: return@mapJSONNotNull null
-			val slug = entry.getString("id")
-			Manga(
-				id = generateUid("/manga/$slug"),
-				title = entry.getString("title"),
-				altTitles = emptySet(),
-				url = "/manga/$slug",
-				publicUrl = "https://$domain/manga/$slug",
-				rating = RATING_UNKNOWN,
-				contentRating = null,
-				coverUrl = jo.optJSONObject("coverImage")?.getStringOrNull("large"),
-				tags = emptySet(),
-				state = null,
-				authors = emptySet(),
-				source = source,
-			)
-		}
-	}
-
-	private fun JSONObject.toListManga(): Manga {
+	/** An item of the catalogue or of the search results. */
+	private fun JSONObject.toManga(): Manga {
 		val slug = getString("slug")
+		val url = "/manga/$slug/"
 		val title = getString("title")
+		val rating = getFloatOrDefault("rating", 0f)
 		return Manga(
-			id = generateUid("/manga/$slug"),
+			id = generateUid(url),
 			title = title,
 			altTitles = setOfNotNull(
 				getStringOrNull("titleEnglish"),
 				getStringOrNull("titleRomaji"),
 				getStringOrNull("titleNative"),
-			).minus(title),
-			url = "/manga/$slug",
+			).filterNotTo(LinkedHashSet()) { it.equals(title, ignoreCase = true) },
+			url = url,
 			publicUrl = "https://$domain/manga/$slug",
-			rating = RATING_UNKNOWN,
+			rating = if (rating > 0f) (rating / 10f).coerceAtMost(1f) else RATING_UNKNOWN,
 			contentRating = null,
 			coverUrl = getStringOrNull("image"),
 			tags = emptySet(),
@@ -183,89 +186,142 @@ internal class Aniverse(context: MangaLoaderContext) :
 	// -------------------------------------------------------------- details
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val slug = slugOf(manga)
-		val flight = flightOf(slug)
-		val obj = findMangaObject(flight, slug)
-		val coverUrl = obj?.optJSONObject("coverImage")?.getStringOrNull("large")
-		val score = obj?.optDouble("averageScore", 0.0) ?: 0.0
+		val (slug, html) = loadMangaPage(manga)
+		val pageUrl = "https://$domain/manga/$slug"
+		val flight = buildFlightText(html)
+		val obj = findMangaObject(flight, slug) ?: throw ParseException("Manga data not found", pageUrl)
+		val chapters = findChaptersArray(flight)?.takeIf { it.length() > 0 }
+			?: fetchChaptersFromReader(slug, obj.getString("databaseId"))
+		val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
+			timeZone = TimeZone.getTimeZone("UTC")
+		}
+		val now = System.currentTimeMillis()
+		val title = obj.titleAsString() ?: manga.title
+		val score = obj.getFloatOrDefault("averageScore", 0f)
 		return manga.copy(
-			title = obj?.titleAsString() ?: manga.title,
-			altTitles = obj?.altTitles() ?: manga.altTitles,
-			description = obj?.getStringOrNull("description")?.cleanDescription(),
-			coverUrl = coverUrl ?: manga.coverUrl,
-			largeCoverUrl = obj?.getStringOrNull("bannerImage") ?: coverUrl,
-			rating = if (score > 0.0) (score / 100.0).toFloat() else RATING_UNKNOWN,
-			contentRating = if (obj?.optBoolean("isAdult", false) == true) {
-				ContentRating.ADULT
-			} else {
-				null
-			},
-			tags = obj?.tagsOrEmpty() ?: emptySet(),
-			state = obj?.let { parseState(it.getStringOrNull("status")) },
-			authors = obj?.authorsOrEmpty() ?: emptySet(),
-			chapters = findChaptersArray(flight)?.mapJSON { it.toChapter(slug) },
+			title = title,
+			publicUrl = pageUrl,
+			altTitles = obj.altTitles(title).ifEmpty { manga.altTitles },
+			description = obj.descriptionOrNull(),
+			coverUrl = obj.optJSONObject("coverImage")?.getStringOrNull("large") ?: manga.coverUrl,
+			rating = if (score > 0f) (score / 100f).coerceAtMost(1f) else manga.rating,
+			contentRating = if (obj.getBooleanOrDefault("isAdult", false)) ContentRating.ADULT else manga.contentRating,
+			tags = obj.genreTags(),
+			state = parseState(obj.getStringOrNull("status")) ?: manga.state,
+			authors = obj.peopleOrEmpty(),
+			// Premium chapters can't be read until premiumUntil (the reader answers "locked").
+			chapters = chapters?.mapJSONNotNull { jo ->
+				if (parseDate(dateFormat, jo.getStringOrNull("premiumUntil")) > now) {
+					null
+				} else {
+					jo.toChapter(slug, dateFormat)
+				}
+			}.orEmpty(),
+		)
+	}
+
+	override suspend fun resolveLink(resolver: LinkResolver, link: HttpUrl): Manga? {
+		val segments = link.pathSegments.filter { it.isNotEmpty() }
+		if (segments.size < 2 || segments[0] !in LINK_PREFIXES) {
+			return null
+		}
+		val slug = segments[1]
+		val url = "/manga/$slug/"
+		return getDetails(
+			Manga(
+				id = generateUid(url),
+				title = slug,
+				altTitles = emptySet(),
+				url = url,
+				publicUrl = "https://$domain/manga/$slug",
+				rating = RATING_UNKNOWN,
+				contentRating = null,
+				coverUrl = null,
+				tags = emptySet(),
+				state = null,
+				authors = emptySet(),
+				source = source,
+			),
 		)
 	}
 
 	// ---------------------------------------------------------------- pages
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val parts = chapter.url.trim('/').split('/')
-		val slug = parts.getOrNull(1) ?: return emptyList()
-		val uuid = parts.getOrNull(2) ?: return emptyList()
-		val url = "https://$domain/api/manga/reader".toHttpUrl().newBuilder()
-			.addQueryParameter("manga", slug)
-			.addQueryParameter("chapter", uuid)
-			.build()
-		val pages = webClient.httpGet(url).parseJson().optJSONArray("pages")
-		if (pages != null && pages.length() > 0) {
-			return pages.mapJSON { jo ->
-				MangaPage(
-					id = generateUid(jo.getString("id")),
-					url = jo.getString("src"),
-					preview = null,
-					source = source,
-				)
-			}
+		// "/read/{slug}/{uuid}"
+		val segments = chapter.url.split('/').filter { it.isNotEmpty() }
+		if (segments.size < 3) {
+			throw ParseException("Invalid chapter url", chapter.url)
 		}
-		// Fallback : extraction depuis la page de lecture
-		val html = webClient.httpGet("https://$domain/read/$slug/$uuid").parseRaw()
-		val seen = HashSet<String>()
-		return IMAGE_URL_REGEX.findAll(html)
-			.map { it.value }
-			.filter { seen.add(it) }
-			.map { src ->
+		return fetchReader(segments[1], segments[2])
+			.getJSONArray("pages")
+			.mapJSON { jo ->
+				val src = jo.getString("src")
 				MangaPage(
-					id = generateUid(src),
+					id = generateUid(jo.getStringOrNull("id") ?: src),
 					url = src,
 					preview = null,
 					source = source,
 				)
 			}
-			.toList()
 	}
 
 	// ------------------------------------------------------------- internals
 
-	private fun slugOf(manga: Manga): String =
-		manga.url.substringAfter("/manga/").substringBefore('?').trim('/')
-
-	private suspend fun flightOf(slug: String): String {
-		flightCache?.let { (cachedSlug, cachedFlight) ->
-			if (cachedSlug == slug) {
-				return cachedFlight
-			}
-		}
-		val html = webClient.httpGet("https://$domain/manga/$slug").parseRaw()
-		val flight = buildFlightText(html)
-		flightCache = slug to flight
-		return flight
+	private suspend fun fetchReader(slug: String, chapterId: String): JSONObject {
+		val url = urlBuilder()
+			.addPathSegments("api/manga/reader")
+			.addQueryParameter("manga", slug)
+			.addQueryParameter("chapter", chapterId)
+			.build()
+		return webClient.httpGet(url).parseJson()
 	}
 
 	/**
-	 * Extrait et concatène les payloads RSC (`self.__next_f.push([1, "..."])`)
-	 * en dé-échappant les chaînes JavaScript — scan manuel (les gros payloads
-	 * font exploser la pile de java.util.regex).
+	 * The manga page is cached by the site for a few minutes, so right after an import its payload can have
+	 * no chapters yet: ask the reader, which always returns the full list, starting from the first chapter.
+	 */
+	private suspend fun fetchChaptersFromReader(slug: String, mangaId: String): JSONArray? = runCatchingCancellable {
+		val cardUrl = urlBuilder()
+			.addPathSegments("api/manga/card-info")
+			.addQueryParameter("id", mangaId)
+			.build()
+		val readHref = webClient.httpGet(cardUrl).parseJson().getStringOrNull("readHref")
+			?: return@runCatchingCancellable null
+		fetchReader(slug, readHref.trimEnd('/').substringAfterLast('/')).optJSONArray("chapters")
+	}.getOrNull()
+
+	private fun slugOf(url: String): String =
+		url.substringAfter("/manga/").substringBefore('?').trim('/')
+
+	/** Returns the slug and the html of the manga page. */
+	private suspend fun loadMangaPage(manga: Manga): Pair<String, String> {
+		val slug = slugOf(manga.url)
+		return try {
+			slug to webClient.httpGet("https://$domain/manga/$slug").parseRaw()
+		} catch (e: NotFoundException) {
+			val renamed = findRenamedSlug(manga) ?: throw e
+			renamed to webClient.httpGet("https://$domain/manga/$renamed").parseRaw()
+		}
+	}
+
+	/**
+	 * Most RaijinScans slugs were kept by Aniverse, but some changed (a numeric suffix dropped, a new title).
+	 * Library entries keep their url (and id), and are looked up by title: only an unambiguous match counts.
+	 */
+	private suspend fun findRenamedSlug(manga: Manga): String? {
+		val titles = (manga.altTitles + manga.title).mapNotNullTo(HashSet()) { it.normalizedTitle().ifEmpty { null } }
+		val matches = getListPage(1, SortOrder.RELEVANCE, MangaListFilter(query = manga.title)).filter {
+			it.title.normalizedTitle() in titles
+		}
+		return matches.singleOrNull()?.let { slugOf(it.url) }?.takeUnless { it == slugOf(manga.url) }
+	}
+
+	private fun String.normalizedTitle(): String = lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
+
+	/**
+	 * Extracts and joins the RSC payloads (`self.__next_f.push([1, "..."])`), unescaping the JavaScript
+	 * strings. Scanned by hand: big payloads overflow the java.util.regex stack.
 	 */
 	private fun buildFlightText(html: String): String {
 		val sb = StringBuilder(html.length)
@@ -280,7 +336,7 @@ internal class Aniverse(context: MangaLoaderContext) :
 				searchFrom = i
 				continue
 			}
-			i++ // guillemet ouvrant
+			i++ // opening quote
 			val start = i
 			var escaped = false
 			var end = -1
@@ -320,7 +376,7 @@ internal class Aniverse(context: MangaLoaderContext) :
 			if (start != -1) {
 				val end = findJsonEnd(flight, start, '{', '}')
 				if (end != -1) {
-					val json = runCatching { JSONObject(flight.substring(start, end + 1)) }.getOrNull()
+					val json = flight.substring(start, end + 1).toJSONObjectOrNull()
 					if (json != null && json.has("databaseId") && json.has("genres")) {
 						return json
 					}
@@ -331,29 +387,40 @@ internal class Aniverse(context: MangaLoaderContext) :
 		return null
 	}
 
+	/**
+	 * The page props hold the chapter list as a reference to another RSC row (`"chapters":"$@3a"`,
+	 * then a `3a:[...]` row), or inline.
+	 */
 	private fun findChaptersArray(flight: String): JSONArray? {
-		var best: JSONArray? = null
-		var index = flight.indexOf(CHAPTERS_ARRAY_MARKER)
-		while (index != -1) {
-			val end = findJsonEnd(flight, index, '[', ']')
-			if (end != -1) {
-				val parsed = runCatching { JSONArray(flight.substring(index, end + 1)) }.getOrNull()
-				val first = parsed?.optJSONObject(0)
-				if (parsed != null && first != null && first.has("previewImage") && first.has("number")) {
-					if (best == null || parsed.length() > best.length()) {
-						best = parsed
-					}
+		for (match in CHAPTERS_REGEX.findAll(flight)) {
+			val ref = match.groupValues[1]
+			val start = if (ref.isEmpty()) {
+				match.range.last
+			} else {
+				val row = "\n$ref:"
+				val rowIndex = flight.indexOf(row)
+				if (rowIndex == -1) {
+					continue
 				}
+				rowIndex + row.length
 			}
-			index = flight.indexOf(CHAPTERS_ARRAY_MARKER, index + 1)
+			if (flight.getOrNull(start) != '[') {
+				continue
+			}
+			val end = findJsonEnd(flight, start, '[', ']')
+			if (end == -1) {
+				continue
+			}
+			val array = flight.substring(start, end + 1).toJSONArrayOrNull() ?: continue
+			val first = array.optJSONObject(0)
+			if (array.length() == 0 || (first != null && first.has("id") && first.has("number"))) {
+				return array
+			}
 		}
-		return best
+		return null
 	}
 
-	/**
-	 * Recherche la fin d'un objet/tableau JSON à partir de son ouverture,
-	 * en respectant les chaînes de caractères.
-	 */
+	/** Finds the end of the JSON object or array opened at [start], skipping strings. */
 	private fun findJsonEnd(text: String, start: Int, open: Char, close: Char): Int {
 		var depth = 0
 		var inString = false
@@ -382,108 +449,96 @@ internal class Aniverse(context: MangaLoaderContext) :
 		return -1
 	}
 
-	private fun JSONObject.toChapter(slug: String): MangaChapter {
-		val uuid = getString("id")
-		val number = when (val raw = opt("number")) {
-			is Number -> raw.toFloat()
-			is String -> raw.toFloatOrNull() ?: 0f
-			else -> 0f
-		}
+	private fun JSONObject.toChapter(slug: String, dateFormat: DateFormat): MangaChapter {
+		val url = "/read/$slug/${getString("id")}"
+		val number = getFloatOrDefault("number", 0f)
+		val isVolume = getStringOrNull("kind") == "tome"
 		return MangaChapter(
-			id = generateUid("/read/$slug/$uuid"),
-			title = chapterTitle(number),
+			id = generateUid(url),
+			title = getStringOrNull("title")?.replaceFirst(CHAPTER_PREFIX_REGEX, "")?.trim()?.ifEmpty { null }
+				?: if (isVolume) "Tome ${formatNumber(number)}" else null,
 			number = number,
-			volume = intOrZero("volume"),
-			url = "/read/$slug/$uuid",
+			volume = if (isVolume) number.toInt() else getIntOrDefault("volume", 0),
+			url = url,
 			scanlator = null,
-			uploadDate = parseDate(getStringOrNull("updatedAt")),
+			uploadDate = parseDate(dateFormat, getStringOrNull("updatedAt")),
 			branch = null,
 			source = source,
 		)
 	}
 
-	/**
-	 * "Chapitre 26 - Le flingue bat la pierre" -> "Le flingue bat la pierre"
-	 * (le modèle Kotatsu ne doit pas contenir le numéro dans le titre)
-	 */
-	private fun JSONObject.chapterTitle(number: Float): String? {
-		val raw = getStringOrNull("title") ?: return null
-		if (raw.isBlank()) {
-			return null
-		}
-		val prefix = Regex(
-			"^\\s*(?:chapitre|chapter)\\s*" + Regex.escape(formatNumber(number)) + "\\s*(?:[-–—:.]\\s*)?",
-			RegexOption.IGNORE_CASE,
-		)
-		return raw.replaceFirst(prefix, "").trim().ifEmpty { null }
-	}
-
 	private fun JSONObject.titleAsString(): String? {
-		val titleObj = optJSONObject("title") ?: return opt("title") as? String
+		val titleObj = optJSONObject("title") ?: return getStringOrNull("title")
 		return titleObj.getStringOrNull("userPreferred")
 			?: titleObj.getStringOrNull("english")
 			?: titleObj.getStringOrNull("romaji")
 			?: titleObj.getStringOrNull("native")
 	}
 
-	private fun JSONObject.altTitles(): Set<String> {
+	private fun JSONObject.altTitles(title: String): Set<String> {
 		val titleObj = optJSONObject("title") ?: return emptySet()
 		return setOfNotNull(
-			titleObj.getStringOrNull("userPreferred"),
 			titleObj.getStringOrNull("english"),
 			titleObj.getStringOrNull("romaji"),
 			titleObj.getStringOrNull("native"),
-		).minus(titleAsString().orEmpty())
+		).filterNotTo(LinkedHashSet()) { it.equals(title, ignoreCase = true) }
 	}
 
-	private fun JSONObject.tagsOrEmpty(): Set<MangaTag> {
-		val genres = optJSONArray("genres") ?: return emptySet()
-		val result = LinkedHashSet<MangaTag>(genres.length())
-		for (i in 0 until genres.length()) {
-			val name = genres.optString(i)
-			if (name.isBlank()) {
+	/** Titles without an AniList entry have no description of their own, only the one of their source. */
+	private fun JSONObject.descriptionOrNull(): String? {
+		getStringOrNull("description")?.let { return it }
+		val sources = optJSONObject("savedMetadata")
+			?.optJSONObject("otherInfo")
+			?.optJSONObject("sources")
+			?: return null
+		for (key in sources.keys()) {
+			sources.optJSONObject(key)?.getStringOrNull("description")?.let { return it.trim().nl2br() }
+		}
+		return null
+	}
+
+	private fun JSONObject.genreTags(): Set<MangaTag> {
+		val array = optJSONArray("genres") ?: return emptySet()
+		val result = LinkedHashSet<MangaTag>(array.length())
+		for (i in 0 until array.length()) {
+			val name = array.optString(i).trim()
+			if (name.isEmpty()) {
 				continue
 			}
-			result.add(TAGS_BY_KEY[name.lowercase(Locale.ROOT)] ?: MangaTag(name, name, source))
+			// AniList genres are the filter keys; titles from other sources may use the French label.
+			result += genres.find { it.key.equals(name, ignoreCase = true) || it.title.equals(name, ignoreCase = true) }
+				?: MangaTag(title = name.toTitleCase(sourceLocale), key = name, source = source)
 		}
 		return result
 	}
 
-	private fun JSONObject.authorsOrEmpty(): Set<String> {
-		val authors = optJSONArray("authors") ?: return emptySet()
-		val result = LinkedHashSet<String>(authors.length())
-		for (i in 0 until authors.length()) {
-			val name = authors.optString(i)
-			if (name.isNotBlank()) {
-				result.add(name)
+	private fun JSONObject.peopleOrEmpty(): Set<String> {
+		val result = LinkedHashSet<String>()
+		for (field in arrayOf("authors", "artists")) {
+			val array = optJSONArray(field) ?: continue
+			for (i in 0 until array.length()) {
+				array.optString(i).trim().takeIf { it.isNotEmpty() }?.let { result += it }
 			}
 		}
 		return result
 	}
 
-	private fun parseState(raw: String?): MangaState? = when (raw?.lowercase(Locale.ROOT)?.replace(" ", "")?.replace("_", "")) {
-		"ongoing", "releasing" -> MangaState.ONGOING
-		"finished" -> MangaState.FINISHED
-		"onhiatus", "hiatus" -> MangaState.PAUSED
-		"cancelled", "canceled" -> MangaState.ABANDONED
-		"upcoming", "notyetreleased" -> MangaState.UPCOMING
-		else -> null
-	}
+	private fun parseState(raw: String?): MangaState? =
+		when (raw?.lowercase(Locale.ROOT)?.replace(" ", "")?.replace("_", "")) {
+			"ongoing", "releasing" -> MangaState.ONGOING
+			"finished" -> MangaState.FINISHED
+			"onhiatus", "hiatus" -> MangaState.PAUSED
+			"cancelled", "canceled" -> MangaState.ABANDONED
+			"upcoming", "notyetreleased" -> MangaState.UPCOMING
+			else -> null
+		}
 
-	private fun JSONObject.intOrZero(name: String): Int = when (val raw = opt(name)) {
-		is Number -> raw.toInt()
-		is String -> raw.toIntOrNull() ?: 0
-		else -> 0
-	}
-
-	private fun parseDate(raw: String?): Long {
+	private fun parseDate(dateFormat: DateFormat, raw: String?): Long {
 		if (raw.isNullOrEmpty()) {
 			return 0L
 		}
 		return try {
-			synchronized(dateFormat) {
-				dateFormat.parse(raw)?.time ?: 0L
-			}
+			dateFormat.parse(raw)?.time ?: 0L
 		} catch (_: Exception) {
 			0L
 		}
@@ -491,42 +546,39 @@ internal class Aniverse(context: MangaLoaderContext) :
 
 	private fun formatNumber(value: Float): String =
 		if (value % 1f == 0f) value.toInt().toString() else value.toString()
-
-	private fun String.cleanDescription(): String? {
-		val text = Jsoup.parse(replace(HTML_BREAK_REGEX, "\n")).text().trim()
-		return text.ifEmpty { null }
-	}
 }
 
 private const val PAGE_SIZE = 28
-private const val SEARCH_PAGE_SIZE = 50
-private const val ANILIST_URL = "https://graphql.anilist.co"
 
 private const val NEXT_F_PREFIX = "self.__next_f.push([1,"
 
-private val CHAPTERS_ARRAY_MARKER = "[{\"id\":\""
-private val IMAGE_URL_REGEX = Regex("""https://cdn\.onefy\.me/raw/manga/[0-9a-fA-F-]{36}/[A-Za-z0-9_-]+/\d{3}\.(?:jpg|jpeg|png|webp)""")
-private val HTML_BREAK_REGEX = Regex("(?i)<br\\s*/?>")
+private val LINK_PREFIXES = setOf("manga", "read")
 
-private val TAGS: Set<MangaTag> = linkedSetOf(
-	MangaTag("Action", "Action", MangaParserSource.ANIVERSE),
-	MangaTag("Aventure", "Adventure", MangaParserSource.ANIVERSE),
-	MangaTag("Comédie", "Comedy", MangaParserSource.ANIVERSE),
-	MangaTag("Drame", "Drama", MangaParserSource.ANIVERSE),
-	MangaTag("Ecchi", "Ecchi", MangaParserSource.ANIVERSE),
-	MangaTag("Fantasy", "Fantasy", MangaParserSource.ANIVERSE),
-	MangaTag("Horreur", "Horror", MangaParserSource.ANIVERSE),
-	MangaTag("Mahou shoujo", "Mahou Shoujo", MangaParserSource.ANIVERSE),
-	MangaTag("Mecha", "Mecha", MangaParserSource.ANIVERSE),
-	MangaTag("Musique", "Music", MangaParserSource.ANIVERSE),
-	MangaTag("Mystère", "Mystery", MangaParserSource.ANIVERSE),
-	MangaTag("Psychologique", "Psychological", MangaParserSource.ANIVERSE),
-	MangaTag("Romance", "Romance", MangaParserSource.ANIVERSE),
-	MangaTag("Science-fiction", "Sci-Fi", MangaParserSource.ANIVERSE),
-	MangaTag("Tranche de vie", "Slice of Life", MangaParserSource.ANIVERSE),
-	MangaTag("Sport", "Sports", MangaParserSource.ANIVERSE),
-	MangaTag("Surnaturel", "Supernatural", MangaParserSource.ANIVERSE),
-	MangaTag("Thriller", "Thriller", MangaParserSource.ANIVERSE),
+private val CHAPTERS_REGEX = Regex(""""chapters":(?:"\$@?([0-9a-zA-Z]+)"|\[)""")
+
+private val CHAPTER_PREFIX_REGEX = Regex(
+	"""^\s*(?:chapitre|chapter)\s*\d+(?:[.,]\d+)?\s*(?:[-–—:.]\s*)?""",
+	RegexOption.IGNORE_CASE,
 )
 
-private val TAGS_BY_KEY: Map<String, MangaTag> = TAGS.associateBy { it.key.lowercase(Locale.ROOT) }
+/** Genre keys of the site's filters (AniList genres) to their French labels on the site. */
+private val GENRES = listOf(
+	"Action" to "Action",
+	"Adventure" to "Aventure",
+	"Comedy" to "Comédie",
+	"Drama" to "Drame",
+	"Ecchi" to "Ecchi",
+	"Fantasy" to "Fantasy",
+	"Horror" to "Horreur",
+	"Mahou Shoujo" to "Mahou shoujo",
+	"Mecha" to "Mecha",
+	"Music" to "Musique",
+	"Mystery" to "Mystère",
+	"Psychological" to "Psychologique",
+	"Romance" to "Romance",
+	"Sci-Fi" to "Science-fiction",
+	"Slice of Life" to "Tranche de vie",
+	"Sports" to "Sport",
+	"Supernatural" to "Surnaturel",
+	"Thriller" to "Thriller",
+)
