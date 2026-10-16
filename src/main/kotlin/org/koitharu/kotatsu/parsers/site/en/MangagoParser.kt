@@ -181,7 +181,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
                 contentRating = ContentRating.SAFE,
                 source = source,
             )
-        }
+        }.distinctBy { it.url } // desktop pages nest .box inside .pic_list > li, both match
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
