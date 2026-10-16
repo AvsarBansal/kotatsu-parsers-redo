@@ -161,6 +161,10 @@ internal class MangagoParser(context: MangaLoaderContext) :
             val title = linkElement.attr("title").ifEmpty {
                 linkElement.selectFirst("h2 a")?.text() ?: return@mapNotNull null
             }
+            // Removed uploads are filed under a "DELETE" title, which the site's own search leaves out
+            if (title == DELETED_UPLOADS_TITLE && DELETED_UPLOADS_URL_REGEX.containsMatchIn(href)) {
+                return@mapNotNull null
+            }
             val thumbnailElem = linkElement.selectFirst("img") ?: return@mapNotNull null
             val thumbnailUrl = thumbnailElem.attr("abs:data-src").ifEmpty {
                 thumbnailElem.attr("abs:src")
@@ -828,5 +832,7 @@ internal class MangagoParser(context: MangaLoaderContext) :
         private val OFFICIAL_REGEX = Regex("""\bofficial\b""", RegexOption.IGNORE_CASE)
         private val PARTNER_CHAPTER_REGEX = Regex("""^https?://[^/]+(/chapter/\d+/\d+/?)$""")
         private const val DETAILS_PAGE_ATTEMPTS = 5
+        private const val DELETED_UPLOADS_TITLE = "DELETE"
+        private val DELETED_UPLOADS_URL_REGEX = Regex("""/read-manga/delete_\d+/?$""")
     }
 }
