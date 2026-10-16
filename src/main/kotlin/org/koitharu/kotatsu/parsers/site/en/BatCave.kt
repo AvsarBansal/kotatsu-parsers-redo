@@ -218,27 +218,33 @@ internal class BatCave(context: MangaLoaderContext) :
 			if (System.currentTimeMillis() - lastGuardSolveAt < GUARD_TRUST_WINDOW_MS) {
 				return@withLock true
 			}
-			// The challenge page runs its check and redirects back once the trust cookie is set
-			val script = """
-				(() => new Promise(resolve => {
-					const started = Date.now();
-					const check = () => {
-						if (!location.pathname.startsWith("/_c") || document.cookie.indexOf("$DLE_GUARD_COOKIE=") >= 0) {
-							resolve("ok");
-						} else if (Date.now() - started > 25000) {
-							resolve("timeout");
-						} else {
-							setTimeout(check, 250);
-						}
-					};
-					check();
-				}))();
-			""".trimIndent()
-			runCatchingCancellable { context.evaluateJs(url, script, timeout = 30000L) }
-			hasDleGuardTrust().also { solved ->
-				if (solved) lastGuardSolveAt = System.currentTimeMillis()
+			val solved = solveDleGuardInWebView(url)
+			if (solved) {
+				lastGuardSolveAt = System.currentTimeMillis()
 			}
+			solved
 		}
+	}
+
+	private suspend fun solveDleGuardInWebView(url: String): Boolean {
+		// The challenge page runs its check and redirects back once the trust cookie is set
+		val script = """
+			(() => new Promise(resolve => {
+				const started = Date.now();
+				const check = () => {
+					if (!location.pathname.startsWith("/_c") || document.cookie.indexOf("$DLE_GUARD_COOKIE=") >= 0) {
+						resolve("ok");
+					} else if (Date.now() - started > 25000) {
+						resolve("timeout");
+					} else {
+						setTimeout(check, 250);
+					}
+				};
+				check();
+			}))();
+		""".trimIndent()
+		runCatchingCancellable { context.evaluateJs(url, script, timeout = 30000L) }
+		return hasDleGuardTrust()
 	}
 
 	private fun hasDleGuardTrust(): Boolean =
@@ -246,8 +252,10 @@ internal class BatCave(context: MangaLoaderContext) :
 
 	private fun HttpUrl.isDleGuard(): Boolean = pathSegments.firstOrNull() == "_c"
 
+	// A page captured from the WebView keeps the requested URL as its location, so also look for the challenge script
 	private fun isDleGuardPage(doc: Document): Boolean =
-		doc.location().toHttpUrlOrNull()?.isDleGuard() == true
+		doc.location().toHttpUrlOrNull()?.isDleGuard() == true ||
+			doc.selectFirst("script:containsData(pow_nonce)") != null
 
 	private fun hasValidBatCaveContent(doc: Document): Boolean {
 		if (isDleGuardPage(doc)) {
@@ -271,6 +279,13 @@ internal class BatCave(context: MangaLoaderContext) :
 			(lower.contains("checking your browser") && lower.contains("cloudflare")) ||
 			lower.contains("cf-browser-verification") ||
 			lower.contains("cf-chl-opt")
+	}
+
+	override suspend fun getFavicons(): Favicons {
+		if (!hasDleGuardTrust()) {
+			solveDleGuard("https://$domain/")
+		}
+		return super.getFavicons()
 	}
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
@@ -463,6 +478,9 @@ internal class BatCave(context: MangaLoaderContext) :
 		}
 
 		return manga.copy(
+			// Links opened directly only carry a placeholder title and no cover
+			title = doc.selectFirst("header.page__header h1")?.textOrNull() ?: manga.title,
+			coverUrl = manga.coverUrl?.nullIfEmpty() ?: doc.selectFirst("div.page__poster img")?.attrAsAbsoluteUrlOrNull("src"),
 			authors = setOfNotNull(author),
 			state = state,
 			chapters = chapters,
@@ -477,13 +495,13 @@ internal class BatCave(context: MangaLoaderContext) :
 	 * as a string. Braces are matched properly, so a "};" inside a chapter title can't cut it short.
 	 */
 	private fun extractScriptJson(doc: Document, varName: String): String? {
-		val assignment = Regex("""(?:window\.)?${Regex.escape(varName)}\s*=\s*""")
+		// Only a real assignment of an object literal, not reads like Object.assign({...}, window.__DATA__)
+		val assignment = Regex("""(?:window\.)?${Regex.escape(varName)}\s*=\s*(?=\{)""")
 		for (script in doc.select("script")) {
 			val data = script.data()
-			val match = assignment.find(data) ?: continue
-			val start = data.indexOf('{', match.range.last + 1)
-			if (start < 0) continue
-			extractBalancedObject(data, start)?.let { return it }
+			for (match in assignment.findAll(data)) {
+				extractBalancedObject(data, match.range.last + 1)?.let { return it }
+			}
 		}
 		doc.selectFirst("script[type=application/json][id*=${varName.trim('_')}]")
 			?.data()?.trim()?.takeIf { it.startsWith("{") }
@@ -518,6 +536,7 @@ internal class BatCave(context: MangaLoaderContext) :
 
 		const val DLE_GUARD_COOKIE = "__guard_trust"
 		const val GUARD_TRUST_WINDOW_MS = 5_000L
+
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
