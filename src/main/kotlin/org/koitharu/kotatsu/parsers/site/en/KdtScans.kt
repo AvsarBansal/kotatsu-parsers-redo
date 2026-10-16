@@ -252,13 +252,15 @@ internal class KdtScans(context: MangaLoaderContext) :
 
     private companion object {
         const val TOP_WEEK_MARKER = "Top 10 this week"
-        val NEXT_F_PUSH_REGEX = Regex("""self\.__next_f\.push\(\[\s*1\s*,\s*"(.*?)"\s*]\)""", RegexOption.DOT_MATCHES_ALL)
+        // Every literal `]` and `}` is escaped: Android's ICU regex engine rejects them bare where the
+        // JVM's accepts them, so a pattern that passes the JVM tests can crash the app as the class loads
+        val NEXT_F_PUSH_REGEX = Regex("""self\.__next_f\.push\(\[\s*1\s*,\s*"(.*?)"\s*\]\)""", RegexOption.DOT_MATCHES_ALL)
         val SERIES_CARD_REGEX = Regex(""""href":"/series/([^"/]+)/?"(.*?)(?="href":"/series/[^"/]+/?"|\z)""", RegexOption.DOT_MATCHES_ALL)
         val TITLE_REGEX = Regex(""""title":"((?:\\.|[^"\\])*)"""")
         val ALT_REGEX = Regex(""""alt":"((?:\\.|[^"\\])+)"""")
         val SRC_REGEX = Regex(""""src":"((?:\\.|[^"\\])*)"""")
         val STATUS_REGEX = Regex(""""children":"(Completed|Ongoing)"""", RegexOption.IGNORE_CASE)
-        val PAGES_REGEX = Regex(""""pages":\s*(\[\{.*?}])""")
+        val PAGES_REGEX = Regex(""""pages":\s*(\[\{.*?\}\])""")
         val PAGE_IMG_REGEX = Regex(""""url":"(/img/p/[^"]+)"""")
         val GENRE_OPTION_REGEX = Regex(""""value":"([a-zA-Z0-9_-]+)","label":"([^"]+)"""")
         val TAG_COUNT_REGEX = Regex("""\s*\(\d+\)$""")
