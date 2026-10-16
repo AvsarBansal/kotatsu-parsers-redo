@@ -79,10 +79,12 @@ internal class CuuTruyenParser(context: MangaLoaderContext) :
 		val scanlator = data.optJSONObject("team")?.getStringOrNull("name")
 		val chapters = webClient.httpGet("${path.toAbsoluteUrl(domain)}/chapters", getRequestHeaders()).parseJson()
 			.getJSONArray("data").mapJSON { it }.sortedBy { it.getInt("order") }.map { chapter ->
-				val chapterPath = "/api/v2/chapters/${chapter.getLong("id")}"
+				val chapterId = chapter.getLong("id")
+				val chapterPath = "/api/v2/chapters/$chapterId"
 				val number = chapter.getStringOrNull("number")
 				MangaChapter(
-					id = generateUid(chapterPath),
+					// Numeric ids, as the original API parser made them, keep saved history valid.
+					id = generateUid(chapterId),
 					url = chapterPath,
 					title = listOfNotNull(
 						number?.takeIf { it.toFloatOrNull() == null },
@@ -171,9 +173,11 @@ internal class CuuTruyenParser(context: MangaLoaderContext) :
 	)
 
 	private fun JSONObject.toManga(): Manga {
-		val path = "/api/v2/mangas/${getLong("id")}"
+		val mangaId = getLong("id")
+		val path = "/api/v2/mangas/$mangaId"
 		return Manga(
-			id = generateUid(path),
+			// Numeric ids, as the original API parser made them, keep saved favourites valid.
+			id = generateUid(mangaId),
 			url = path,
 			publicUrl = "/mangas/${getLong("id")}".toAbsoluteUrl(domain),
 			title = getString("name"),
