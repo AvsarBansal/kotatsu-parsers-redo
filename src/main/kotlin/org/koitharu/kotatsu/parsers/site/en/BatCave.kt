@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.en
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
@@ -8,6 +9,7 @@ import org.jsoup.HttpStatusException
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -23,6 +25,7 @@ import org.koitharu.kotatsu.parsers.util.json.getFloatOrDefault
 import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.suspendlazy.getOrNull
 import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -218,12 +221,60 @@ internal class BatCave(context: MangaLoaderContext) :
 			if (System.currentTimeMillis() - lastGuardSolveAt < GUARD_TRUST_WINDOW_MS) {
 				return@withLock true
 			}
-			val solved = solveDleGuardInWebView(url)
+			val solved = runCatchingCancellable { solveDleGuardChallenge(url) }.getOrDefault(false) ||
+				solveDleGuardInWebView(url)
 			if (solved) {
 				lastGuardSolveAt = System.currentTimeMillis()
 			}
 			solved
 		}
+	}
+
+	/**
+	 * The guard page only asks for a SHA-256 proof of work ("<token>:<nonce>" hashing to a "00" prefix)
+	 * posted to /_v, which then sets the trust cookie. Solving it here avoids needing a WebView, whose
+	 * copy of the guard script refuses to run in the app's hidden WebView.
+	 */
+	private suspend fun solveDleGuardChallenge(url: String): Boolean {
+		val request = Request.Builder()
+			.get()
+			.url(url)
+			.tag(MangaSource::class.java, source)
+			.build()
+		val token = context.httpClient.newCall(request).await().use { response ->
+			if (!response.request.url.isDleGuard()) {
+				return true
+			}
+			DLE_GUARD_TOKEN_REGEX.find(response.requireBody().string())?.groupValues?.get(1)
+		} ?: return false
+		val startedAt = System.currentTimeMillis()
+		val digest = MessageDigest.getInstance("SHA-256")
+		val nonce = (0 until DLE_GUARD_MAX_NONCE).firstOrNull { n ->
+			digest.digest("$token:$n".toByteArray())[0] == 0.toByte()
+		} ?: return false
+		val hash = digest.digest("$token:$nonce".toByteArray()).joinToString("") { "%02x".format(it) }
+		// The site rejects answers faster than its own script, which hashes 50 nonces per animation frame
+		delay(maxOf(DLE_GUARD_MIN_WORK_MS, (nonce / 50 + 1) * 17L) - (System.currentTimeMillis() - startedAt))
+		val form = mapOf(
+			"token" to token.urlEncoded(),
+			"mode" to "modern",
+			"workTime" to (System.currentTimeMillis() - startedAt).toString(),
+			"iterations" to (nonce + 1).toString(),
+			"hasCrypto" to "1",
+			"pow_nonce" to nonce.toString(),
+			"pow_hash" to hash,
+			"webdriver" to "0",
+			"touch" to "1",
+			"screen_w" to "412",
+			"screen_h" to "915",
+			"screen_cd" to "24",
+			"tz" to (-TimeZone.getDefault().getOffset(startedAt) / 60_000).toString(),
+			"dpr" to "2.625",
+			"cdp" to "0",
+			"cdpf" to "",
+		)
+		webClient.httpPost("https://$domain/_v".toHttpUrl(), form).close()
+		return hasDleGuardTrust()
 	}
 
 	private suspend fun solveDleGuardInWebView(url: String): Boolean {
@@ -536,6 +587,10 @@ internal class BatCave(context: MangaLoaderContext) :
 
 		const val DLE_GUARD_COOKIE = "__guard_trust"
 		const val GUARD_TRUST_WINDOW_MS = 5_000L
+		const val DLE_GUARD_MAX_NONCE = 1_000_000
+		const val DLE_GUARD_MIN_WORK_MS = 50L
+
+		val DLE_GUARD_TOKEN_REGEX = Regex("""\btoken:\s*"([^"]+)"""")
 
 	}
 
