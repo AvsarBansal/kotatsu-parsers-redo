@@ -44,11 +44,6 @@ internal abstract class BaseDoujinDesuParser(
 	private var genresCache: Set<MangaTag>? = null
 	private val genresMutex = Mutex()
 
-	private val detailsCacheLock = Any()
-	private val detailsCache = object : LinkedHashMap<String, Manga>(16, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Manga>?): Boolean = size > 10
-	}
-
 	override val defaultSortOrder: SortOrder
 		get() = SortOrder.UPDATED
 
@@ -265,10 +260,6 @@ internal abstract class BaseDoujinDesuParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		synchronized(detailsCacheLock) {
-			detailsCache[manga.url]?.let { return it }
-		}
-
 		val slug = manga.url.removePrefix("/manga/").removeSuffix("/")
 		val url = "/api/manga/$slug".toAbsoluteUrl(domain)
 
@@ -352,7 +343,7 @@ internal abstract class BaseDoujinDesuParser(
 			.split('|')
 			.mapNotNullToSet { it.trim().takeIf(String::isNotEmpty) }
 
-		val result = manga.copy(
+		return manga.copy(
 			title = title,
 			altTitles = altTitles.ifEmpty { manga.altTitles },
 			authors = setOfNotNull(author),
@@ -363,11 +354,6 @@ internal abstract class BaseDoujinDesuParser(
 			coverUrl = coverUrl ?: manga.coverUrl,
 			chapters = chapters.sortedBy { it.number },
 		)
-
-		synchronized(detailsCacheLock) {
-			detailsCache[manga.url] = result
-		}
-		return result
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
