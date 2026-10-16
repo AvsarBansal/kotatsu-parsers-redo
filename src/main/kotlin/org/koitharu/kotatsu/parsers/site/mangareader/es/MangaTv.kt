@@ -13,8 +13,9 @@ import org.koitharu.kotatsu.parsers.util.*
 
 @MangaSourceParser("MANGATV", "MangaTv", "es")
 internal class MangaTv(context: MangaLoaderContext) :
-	MangaReaderParser(context, MangaParserSource.MANGATV, "www.mangatv.net", pageSize = 25, searchPageSize = 25) {
+	MangaReaderParser(context, MangaParserSource.MANGATV, "mangatv.net", pageSize = 25, searchPageSize = 25) {
 	override val listUrl = "/lista"
+	override val detailsDescriptionSelector = "b:contains(Sinopsis) + span"
 	override val filterCapabilities: MangaListFilterCapabilities
 		get() = super.filterCapabilities.copy(
 			isTagsExclusionSupported = false,
