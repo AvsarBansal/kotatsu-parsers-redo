@@ -33,7 +33,7 @@ import java.util.TimeZone
 internal class OlimpoScans(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.OLIMPOSCANS, 24, 100) {
 
-	override val configKeyDomain = ConfigKey.Domain("olympusbiblioteca.com")
+	override val configKeyDomain = ConfigKey.Domain( "olympusxyz.com")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -84,7 +84,7 @@ internal class OlimpoScans(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val slug = manga.url.substringAfterLast('/')
+		val slug = manga.url.substringAfterLast('/').removePrefix("comic-")
 		val root = webClient.httpGet(detailsUrl(slug), getRequestHeaders()).parseJson()
 		val data = root.optJSONObject("data") ?: return manga
 		return manga.copy(
@@ -103,7 +103,7 @@ internal class OlimpoScans(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val slug = chapter.url.substringAfter("/chapter/").substringBeforeLast("/")
+		val slug = chapter.url.substringAfter("/chapter/").substringBeforeLast("/").removePrefix("comic-")
 		val chapterId = chapter.url.substringAfterLast("/")
 		val root = webClient.httpGet(chapterPagesUrl(slug, chapterId), getRequestHeaders()).parseJson()
 		val pages = root.optJSONObject("chapter")?.optJSONArray("pages") ?: return emptyList()
@@ -137,7 +137,9 @@ internal class OlimpoScans(context: MangaLoaderContext) :
 		}
 
 		if (filter.tags.isNotEmpty()) {
-			url.addQueryParameter("genres", filter.tags.joinToString(",") { it.key })
+            filter.tags.forEach { tag ->
+                url.addQueryParameter("genres[]", tag.key)
+            }
 		}
 
 		filter.states.firstOrNull()?.let { state ->
@@ -242,7 +244,7 @@ internal class OlimpoScans(context: MangaLoaderContext) :
 	}
 
 	private fun parseChapter(slug: String, item: JSONObject): MangaChapter {
-		val chapterId = item.opt("id")?.toString().orEmpty()
+		val chapterId = item.opt("name")?.toString().orEmpty()
 		val numberText = item.optString("name").nullIfEmpty()
 		val titleText = item.optString("title").nullIfEmpty()
 		val title = when {
@@ -271,14 +273,14 @@ internal class OlimpoScans(context: MangaLoaderContext) :
 			val item = items.optJSONObject(i) ?: continue
 			val id = item.opt("id")?.toString().orEmpty()
 			if (id.isBlank()) continue
-			val title = item.optString("name").trim().nullIfEmpty() ?: continue
+			val title = item.optString("name").trim().replaceFirstChar{it.uppercase()}.nullIfEmpty() ?: continue
 			result += MangaTag(
 				key = id,
 				title = title,
 				source = source,
 			)
 		}
-		return result
+		return result.distinctBy { it.title.lowercase() }.toSet()
 	}
 
 	private fun parseAuthors(team: Any?): Set<String> {
@@ -326,9 +328,9 @@ internal class OlimpoScans(context: MangaLoaderContext) :
 		.addQueryParameter("type", "comic")
 		.build()
 
-	private fun chapterPagesUrl(slug: String, chapterId: String) = siteUrl("api/capitulo/comic-$slug/$chapterId")
+	private fun chapterPagesUrl(slug: String, chapterId: String) = siteUrl("api/capitulo/$slug/$chapterId?type=comic")
 
-	private fun apiUrl(path: String) = "https://dashboard.$domain/${path.removePrefix("/")}".toHttpUrl()
+	private fun apiUrl(path: String) = "https://$domain/${path.removePrefix("/")}".toHttpUrl()
 
 	private fun siteUrl(path: String) = "https://$domain/${path.removePrefix("/")}".toHttpUrl()
 
