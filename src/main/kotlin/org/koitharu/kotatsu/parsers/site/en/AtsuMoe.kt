@@ -31,22 +31,41 @@ internal class AtsuMoe(context: MangaLoaderContext) :
 
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
-            isSearchSupported = true
+            isSearchSupported = true,
+            isMultipleTagsSupported = true,
         )
 
     override suspend fun getFilterOptions(): MangaListFilterOptions {
-        return MangaListFilterOptions()
+        val json = webClient.httpGet("${apiUrl}explore/availableFilters").parseJson()
+        val genres = json.getJSONArray("genres")
+        val tags = (0 until genres.length()).map { i ->
+            val genre = genres.getJSONObject(i)
+            MangaTag(
+                key = genre.getString("id"),
+                title = genre.getString("name"),
+                source = source
+            )
+        }.toSet()
+        return MangaListFilterOptions(availableTags = tags)
+    }
+
+    override suspend fun getFavicons(): Favicons {
+        return Favicons(
+            listOf(Favicon("https://$domain/favicon.ico", 32, null)),
+            domain,
+        )
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         val endpoint = when (order) {
-            SortOrder.POPULARITY -> "infinite/trending"
-            SortOrder.UPDATED -> "infinite/recentlyUpdated"
+            SortOrder.POPULARITY -> "home2/hotUpdates"
+            SortOrder.UPDATED -> "home2/recentlyUpdated"
             else -> "infinite/trending"
         }
 
         val url = "${apiUrl}$endpoint".toHttpUrl().newBuilder()
-            .addQueryParameter("page", (page - 1).toString())
+            .addQueryParameter("offset", ((page - 1)*40).toString())
+            .addQueryParameter("limit","40")
             .addQueryParameter("types", "Manga,Manwha,Manhua,OEL")
             .build()
 
